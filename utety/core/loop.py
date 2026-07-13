@@ -168,6 +168,13 @@ class LessonSession:
             answer_hidden=True,
         )
 
+    def present(self, item_id: str) -> Presentation:
+        """Re-present a known item (e.g. after an empty response) without grading."""
+        item = next((i for i in self.course.items if i.id == item_id), None)
+        if item is None:
+            raise ValueError(f"unknown item: {item_id!r}")
+        return self._present(item, item.skill_id)
+
     # ── acknowledgment (the hands-first gate) ──────────────────────────────
     def acknowledge_experience(self, exp_id: str) -> None:
         """Record that the learner has done the physical experiment."""

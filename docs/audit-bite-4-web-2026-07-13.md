@@ -139,3 +139,17 @@ for unanswered items.
 
 *Filed after rebasing `claude/full-audit-kqozzy` onto `0165142`. The tripwire
 test caught the boundary change on first contact — the gate is doing its job.*
+
+## Outcome (same day)
+
+W1–W4 fixed on this branch, with 13 regression tests, and verified end-to-end
+over a real socket (shell → token → step → 403s for missing token and foreign
+Host). Fix highlights: empty responses re-present with a nudge (nothing reaches
+BKT); malformed/out-of-order answers fall back to the learner's real next step;
+per-run CSRF token embedded in the shell and required (case-insensitively) on
+every POST; Host allowlist in the HTTP adapter; card links render only for
+`https://` URLs; `GET /` is side-effect free; learner ids validated
+(`[A-Za-z0-9._-]{1,64}`); sessions capped; the error card carries a
+"Keep going" button and no exception taxonomy. Still open from the smaller
+notes: seam-failure visibility (deliberately suppressed, marked in code) and
+the consent gate (Phase 2).

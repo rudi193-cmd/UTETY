@@ -12,6 +12,11 @@ from utety.web import render
 from utety.web.server import App
 
 
+def post(app: App, path: str, params: dict, body: str = ""):
+    """POST through the router with the app's own CSRF token (as the page does)."""
+    return app.handle("POST", path, params, body, {"X-Utety-Csrf": app.csrf})
+
+
 class TestRender(unittest.TestCase):
     def setUp(self):
         self.course = build_neva_and_theo()
@@ -56,6 +61,15 @@ class TestRender(unittest.TestCase):
         self.assertIn("NGSS", html)
         self.assertIn("https://x", html)
 
+    def test_card_html_links_only_https(self):
+        # Audit bite-4 W3: cards are external input; escaping doesn't stop a
+        # javascript: scheme, so anything non-https renders unlinked.
+        for url in ("javascript:alert(1)", "http://plain.example", "data:text/html,x"):
+            html = render.card_html(SourcedCard(url=url, source="s"))
+            self.assertNotIn("href", html, f"{url!r} must not become a link")
+        linked = render.card_html(SourcedCard(url="https://ok.example", source="s"))
+        self.assertIn('href="https://ok.example"', linked)
+
     def test_feedback_fragment_shows_feedback_and_source(self):
         r = Result("ip1", "sci.3-5.inclined-plane", correct=True,
                    feedback="that's what your hands felt", mastery=0.5,
@@ -77,7 +91,7 @@ class TestAppRouting(unittest.TestCase):
 
     def test_first_step_is_experience(self):
         self.app.handle("GET", "/", {"learner": ["kid1"]}, "")
-        _, _, html = self.app.handle("POST", "/step", {"learner": ["kid1"]}, "")
+        _, _, html = post(self.app, "/step", {"learner": ["kid1"]})
         self.assertIn("First, your hands", html)
 
     def test_unknown_path_404(self):
@@ -85,16 +99,16 @@ class TestAppRouting(unittest.TestCase):
         self.assertEqual(status, 404)
 
     def test_unknown_item_404(self):
-        status, _, _ = self.app.handle("POST", "/answer",
-                                       {"learner": ["kid1"], "item": ["ghost"]}, "response=a")
+        status, _, _ = post(self.app, "/answer",
+                            {"learner": ["kid1"], "item": ["ghost"]}, "response=a")
         self.assertEqual(status, 404)
 
     def test_offline_source_falls_back_to_citation(self):
         # No seam configured → the feedback card carries the item's local citation.
         self.app.handle("GET", "/", {"learner": ["kid1"]}, "")
-        self.app.handle("POST", "/step", {"learner": ["kid1"], "ack": ["exp.ramp"]}, "")
-        _, _, html = self.app.handle("POST", "/answer",
-                                     {"learner": ["kid1"], "item": ["ip1"]}, "response=a")
+        post(self.app, "/step", {"learner": ["kid1"], "ack": ["exp.ramp"]})
+        _, _, html = post(self.app, "/answer",
+                          {"learner": ["kid1"], "item": ["ip1"]}, "response=a")
         self.assertIn("sourced", html)
         self.assertIn("NGSS 3-5-ETS1-1", html)
 
@@ -104,11 +118,109 @@ class TestAppRouting(unittest.TestCase):
             base_url="https://knowledge.utety")
         app = App(Store(":memory:"), build_neva_and_theo(), seam=seam)
         app.handle("GET", "/", {"learner": ["kid1"]}, "")
-        app.handle("POST", "/step", {"learner": ["kid1"], "ack": ["exp.ramp"]}, "")
-        _, _, html = app.handle("POST", "/answer",
-                                {"learner": ["kid1"], "item": ["ip1"]}, "response=a")
+        post(app, "/step", {"learner": ["kid1"], "ack": ["exp.ramp"]})
+        _, _, html = post(app, "/answer",
+                          {"learner": ["kid1"], "item": ["ip1"]}, "response=a")
         self.assertIn("Two New Sciences", html)
         self.assertIn("badge hi", html)
+
+
+class TestAbsenceIsNeverGraded(unittest.TestCase):
+    """Audit bite-4 W1: a stray Check click must not touch the mastery signal."""
+
+    def setUp(self):
+        self.app = App(Store(":memory:"), build_neva_and_theo())
+        post(self.app, "/step", {"learner": ["kid1"]})
+        post(self.app, "/step", {"learner": ["kid1"], "ack": ["exp.ramp"]})
+
+    def _outcomes(self):
+        return self.app.store.outcome_history("kid1", "sci.3-5.inclined-plane")
+
+    def test_empty_single_represents_instead_of_grading(self):
+        status, _, html = post(self.app, "/answer",
+                               {"learner": ["kid1"], "item": ["ip1"]}, "")
+        self.assertEqual(status, 200)
+        self.assertIn('class="card item"', html)      # the item again, not feedback
+        self.assertIn("Pick an answer first", html)
+        self.assertEqual(self._outcomes(), [], "no outcome may be recorded")
+
+    def test_empty_boolean_represents_instead_of_500(self):
+        status, _, html = post(self.app, "/answer",
+                               {"learner": ["kid1"], "item": ["ip2"]}, "")
+        self.assertEqual(status, 200)
+        self.assertIn('class="card item"', html)
+        self.assertEqual(self._outcomes(), [])
+
+    def test_empty_multi_represents_instead_of_grading(self):
+        post(self.app, "/step", {"learner": ["kid1"], "ack": ["exp.lever"]})
+        status, _, html = post(self.app, "/answer",
+                               {"learner": ["kid1"], "item": ["lf1"]}, "")
+        self.assertEqual(status, 200)
+        self.assertIn('class="card item"', html)
+        self.assertEqual(
+            self.app.store.outcome_history("kid1", "sci.3-5.lever-fulcrum"), [])
+
+    def test_crafted_garbage_boolean_records_nothing(self):
+        status, _, _ = post(self.app, "/answer",
+                            {"learner": ["kid1"], "item": ["ip2"]}, "response=banana")
+        self.assertEqual(status, 200)
+        self.assertEqual(self._outcomes(), [])
+
+    def test_answer_before_gate_redirects_to_real_next_step(self):
+        # lf1 requires exp.lever, not yet acked: no 500, no outcome — the
+        # learner's actual next step comes back instead.
+        status, _, html = post(self.app, "/answer",
+                               {"learner": ["kid1"], "item": ["lf1"]}, "response=arm")
+        self.assertEqual(status, 200)
+        self.assertNotIn("went quiet", html)
+        self.assertEqual(
+            self.app.store.outcome_history("kid1", "sci.3-5.lever-fulcrum"), [])
+
+
+class TestWebHardening(unittest.TestCase):
+    def setUp(self):
+        self.app = App(Store(":memory:"), build_neva_and_theo())
+
+    def test_post_without_csrf_token_403(self):
+        # Audit bite-4 W2: no cross-origin page can blind-fire writes.
+        status, _, _ = self.app.handle("POST", "/step", {"learner": ["kid1"]}, "")
+        self.assertEqual(status, 403)
+        status, _, _ = self.app.handle("POST", "/step", {"learner": ["kid1"]}, "",
+                                       {"X-Utety-Csrf": "wrong"})
+        self.assertEqual(status, 403)
+
+    def test_page_shell_carries_the_csrf_token(self):
+        _, _, html = self.app.handle("GET", "/", {"learner": ["kid1"]}, "")
+        self.assertIn(self.app.csrf, html)
+
+    def test_get_root_creates_no_learner(self):
+        # Audit bite-4 W4: GET is side-effect free.
+        self.app.handle("GET", "/", {"learner": ["driveby"]}, "")
+        self.assertIsNone(self.app.store.get_learner("driveby"))
+
+    def test_invalid_learner_id_400(self):
+        for bad in ("<script>", "a" * 65, "kid one", ""):
+            status, _, _ = self.app.handle("GET", "/", {"learner": [bad]}, "")
+            self.assertEqual(status, 400, f"learner {bad!r} must be rejected")
+
+    def test_error_page_offers_recovery(self):
+        # Force a genuine 500: a session whose next_step explodes.
+        post(self.app, "/step", {"learner": ["kid1"]})
+        self.app._sessions["kid1"].next_step = None  # not callable → TypeError
+        status, _, html = post(self.app, "/step", {"learner": ["kid1"]})
+        self.assertEqual(status, 500)
+        self.assertIn("data-post", html, "the child must have a way onward")
+        self.assertNotIn("TypeError", html, "no error taxonomy for the child")
+
+    def test_host_allowlist_blocks_rebinding(self):
+        # Audit bite-4 W2: only names that mean this device are served.
+        from utety.web.server import _allowed_hosts, _host_ok
+        allowed = _allowed_hosts("127.0.0.1", 8799)
+        for good in ("127.0.0.1:8799", "localhost:8799", "127.0.0.1", "localhost"):
+            self.assertTrue(_host_ok(good, allowed), good)
+        for evil in ("attacker.example", "attacker.example:8799",
+                     "127.0.0.1.attacker.example:8799", ""):
+            self.assertFalse(_host_ok(evil, allowed), evil)
 
 
 class TestFullPlaythroughOverHTTP(unittest.TestCase):
@@ -120,21 +232,21 @@ class TestFullPlaythroughOverHTTP(unittest.TestCase):
     def test_plays_to_completion_through_the_router(self):
         app = App(Store(":memory:"), build_neva_and_theo())
         app.handle("GET", "/", {"learner": ["kid1"]}, "")
-        _, _, html = app.handle("POST", "/step", {"learner": ["kid1"]}, "")
+        _, _, html = post(app, "/step", {"learner": ["kid1"]})
 
         for _ in range(300):
             if "card complete" in html:
                 break
             if 'class="card item"' in html:
                 iid = re.search(r"item=([\w.]+)", html).group(1)
-                _, _, html = app.handle("POST", "/answer",
-                                        {"learner": ["kid1"], "item": [iid]}, self.BODY[iid])
+                _, _, html = post(app, "/answer",
+                                  {"learner": ["kid1"], "item": [iid]}, self.BODY[iid])
             else:
                 m = re.search(r"ack=([\w.]+)", html)
                 params = {"learner": ["kid1"]}
                 if m and 'class="card experience"' in html:
                     params["ack"] = [m.group(1)]
-                _, _, html = app.handle("POST", "/step", params, "")
+                _, _, html = post(app, "/step", params)
 
         self.assertIn("card complete", html)
         self.assertEqual(html.count("✓"), 2)   # both skills marked mastered

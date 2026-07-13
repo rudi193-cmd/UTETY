@@ -12,6 +12,9 @@ runs.
 """
 from __future__ import annotations
 
+import contextlib
+import re
+import secrets
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -21,6 +24,13 @@ from ..core.loop import LessonSession
 from ..core.store import Store
 from ..knowledge import KnowledgeSeam, SourcedCard
 from . import render
+
+# Learner ids come off the wire; bound them before they touch the store
+# (audit bite-4, W4 — no drive-by junk rows).
+_LEARNER_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_MAX_SESSIONS = 64
+_HTML = "text/html; charset=utf-8"
+_PLAIN = "text/plain; charset=utf-8"
 
 
 class App:
@@ -32,22 +42,41 @@ class App:
         self.seam = seam
         register_course(store, course)
         self._sessions: dict[str, LessonSession] = {}
+        # Per-run CSRF token: embedded in the page shell, required (as the
+        # X-Utety-Csrf header) on every POST. The custom header also forces a
+        # CORS preflight, which this server never grants — so a hostile page
+        # can't even blind-fire writes cross-origin (audit bite-4, W2).
+        self.csrf = secrets.token_urlsafe(32)
 
     # ── session bookkeeping ────────────────────────────────────────────────
     def _session(self, learner: str) -> LessonSession:
         if self.store.get_learner(learner) is None:
             self.store.add_learner(learner, "Explorer")
         if learner not in self._sessions:
+            if len(self._sessions) >= _MAX_SESSIONS:
+                # Sessions are cheap bookkeeping over durable store state
+                # (acks reload from the disclosure log) — evict the oldest.
+                self._sessions.pop(next(iter(self._sessions)))
             self._sessions[learner] = LessonSession(self.store, self.course, learner)
         return self._sessions[learner]
 
     # ── the pure router ────────────────────────────────────────────────────
-    def handle(self, method: str, path: str, params: dict, body: str) -> tuple[int, str, str]:
+    def handle(self, method: str, path: str, params: dict, body: str,
+               headers: dict | None = None) -> tuple[int, str, str]:
+        learner = _one(params, "learner", "kid1")
         try:
+            if not _LEARNER_RE.match(learner):
+                return 400, _PLAIN, "bad learner id"
+            # Header names are case-insensitive on the wire (urllib sends
+            # X-utety-csrf); normalize before comparing.
+            hdrs = {k.lower(): v for k, v in (headers or {}).items()}
+            if method == "POST" and hdrs.get("x-utety-csrf") != self.csrf:
+                return 403, _PLAIN, "missing or wrong csrf token"
+
             if method == "GET" and path == "/":
-                learner = _one(params, "learner", "kid1")
-                self._session(learner)
-                return 200, "text/html; charset=utf-8", render.page_shell(self.course, learner)
+                # Side-effect free: the learner row is created on the first
+                # POST, never by a GET (audit bite-4, W4).
+                return 200, _HTML, render.page_shell(self.course, learner, csrf=self.csrf)
 
             if method == "POST" and path == "/step":
                 return self._step(params)
@@ -55,11 +84,13 @@ class App:
             if method == "POST" and path == "/answer":
                 return self._answer(params, body)
 
-            return 404, "text/plain; charset=utf-8", "not found"
-        except Exception as exc:  # a child should never see a stack trace
-            return 500, "text/html; charset=utf-8", (
+            return 404, _PLAIN, "not found"
+        except Exception:  # a child should never see a stack trace
+            return 500, _HTML, (
                 f'<section class="card"><p class="hanz">Something went quiet in the '
-                f'back shelves. Let\'s try that again.</p><!-- {type(exc).__name__} --></section>'
+                f"back shelves. Let's try that again.</p>"
+                f'<button class="primary" data-post="/step?learner={learner}">'
+                f"Keep going</button></section>"
             )
 
     def _step(self, params: dict) -> tuple[int, str, str]:
@@ -67,7 +98,10 @@ class App:
         sess = self._session(learner)
         ack = _one(params, "ack", "")
         if ack:
-            sess.acknowledge_experience(ack)
+            # A stale/crafted ack must not 500 the child; the real next step
+            # is the answer either way.
+            with contextlib.suppress(ValueError):
+                sess.acknowledge_experience(ack)
         step = sess.next_step()
         if step.kind == "experience":
             html = render.experience_fragment(step.experience, learner)
@@ -83,7 +117,7 @@ class App:
         sess = self._session(learner)
         item = next((i for i in self.course.items if i.id == item_id), None)
         if item is None:
-            return 404, "text/plain; charset=utf-8", "unknown item"
+            return 404, _PLAIN, "unknown item"
 
         qs = parse_qs(body)
         if item.kind == "multi":
@@ -91,9 +125,24 @@ class App:
         else:
             response = qs.get("response", [""])[0]
 
-        result = sess.answer(item_id, response)
+        # Absence is never graded (audit bite-4, W1): a stray "Check" with
+        # nothing selected re-presents the item — no outcome reaches BKT.
+        empty = not response if item.kind == "multi" else not str(response).strip()
+        if empty:
+            return 200, _HTML, render.item_fragment(
+                sess.present(item_id), item, learner,
+                nudge="Pick an answer first — then Check.",
+            )
+
+        try:
+            result = sess.answer(item_id, response)
+        except ValueError:
+            # Malformed or out-of-order request (crafted body, answer before
+            # its experience). Grade nothing; surface the learner's real next
+            # step instead of a dead-end error (audit bite-4, W1).
+            return self._step({"learner": [learner]})
         cards = self._cards_for(result)
-        return 200, "text/html; charset=utf-8", render.feedback_fragment(result, cards, learner)
+        return 200, _HTML, render.feedback_fragment(result, cards, learner)
 
     def _cards_for(self, result) -> list[SourcedCard]:
         """Best-effort sourcing: the seam if configured, else the local citation."""
@@ -110,16 +159,42 @@ class App:
         return [SourcedCard(source=result.citation, snippet="", confidence="")]
 
 
+def _allowed_hosts(host: str, port: int) -> frozenset[str]:
+    """Host-header values a local reading room may be addressed by."""
+    return frozenset({
+        host, f"{host}:{port}",
+        "127.0.0.1", f"127.0.0.1:{port}",
+        "localhost", f"localhost:{port}",
+    })
+
+
+def _host_ok(header_host: str, allowed: frozenset[str]) -> bool:
+    return header_host in allowed
+
+
 def serve(app: App, port: int = 8799, host: str = "127.0.0.1") -> HTTPServer:
-    """Start the reading room on the device. Blocks in serve_forever."""
+    """Build the reading-room server (loopback by default). The caller runs
+    ``serve_forever()`` on the returned server."""
+    allowed = _allowed_hosts(host, port)
 
     class Handler(BaseHTTPRequestHandler):
         def _dispatch(self, method: str) -> None:
+            # DNS-rebinding guard (audit bite-4, W2): a page that points its
+            # own domain at 127.0.0.1 arrives with its domain in Host. Only
+            # names that genuinely mean this device are served.
+            if not _host_ok(self.headers.get("Host", ""), allowed):
+                self.send_response(403)
+                self.send_header("Content-Type", _PLAIN)
+                self.end_headers()
+                self.wfile.write(b"unrecognized host")
+                return
             parsed = urlparse(self.path)
             params = parse_qs(parsed.query)
             length = int(self.headers.get("Content-Length", 0) or 0)
             body = self.rfile.read(length).decode("utf-8") if length else ""
-            status, ctype, text = app.handle(method, parsed.path, params, body)
+            status, ctype, text = app.handle(
+                method, parsed.path, params, body, headers=dict(self.headers)
+            )
             data = text.encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", ctype)
