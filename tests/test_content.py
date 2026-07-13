@@ -192,6 +192,18 @@ class TestRegistration(unittest.TestCase):
             added_again = register_course(s, course)
             self.assertEqual(added_again, [])
 
+    def test_register_updates_changed_params(self):
+        # Audit B6: re-fitted BKT params shipped with a course update must
+        # reach stores that registered the older version.
+        course = build_neva_and_theo()
+        with Store(":memory:") as s:
+            register_course(s, course)
+            updated = build_neva_and_theo()
+            updated.skills[0].bkt = dict(updated.skills[0].bkt, learn=0.33)
+            register_course(s, updated)
+            self.assertAlmostEqual(
+                s.get_skill(updated.skills[0].id)["learn"], 0.33)
+
     def test_registered_skill_drives_the_store_loop(self):
         # End-to-end: register content, then record outcomes against a real skill.
         course = build_neva_and_theo()

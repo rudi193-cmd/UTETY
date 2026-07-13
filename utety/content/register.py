@@ -16,17 +16,28 @@ from .model import Course
 def register_course(store: Store, course: Course) -> list[str]:
     """Register every skill in ``course`` into ``store``. Returns skill ids added.
 
-    Skips skills already present (idempotent). Does not add items or experiences
-    to the store — those live in the content layer, not the student-data store
-    (the store holds the *learner*, the content model holds the *material*).
+    Idempotent per store, and parameter drift is repaired: a skill already
+    present whose course-shipped BKT params have changed gets its params
+    updated in place (params are content, not learner state — mastery rows are
+    untouched; audit 2026-07-13, B6). Does not add items or experiences to the
+    store — those live in the content layer, not the student-data store (the
+    store holds the *learner*, the content model holds the *material*).
     """
     added: list[str] = []
     for s in course.skills:
-        if store.get_skill(s.id) is not None:
+        params = BKTParams(**s.bkt)
+        existing = store.get_skill(s.id)
+        if existing is None:
+            store.add_skill(
+                s.id, s.subject, s.name, standard=s.standard, params=params,
+            )
+            added.append(s.id)
             continue
-        store.add_skill(
-            s.id, s.subject, s.name, standard=s.standard,
-            params=BKTParams(**s.bkt),
+        stored = BKTParams(
+            prior=existing["prior"], learn=existing["learn"],
+            guess=existing["guess"], slip=existing["slip"],
+            forget=existing["forget"],
         )
-        added.append(s.id)
+        if stored != params:
+            store.update_skill_params(s.id, params)
     return added

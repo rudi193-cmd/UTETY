@@ -15,14 +15,15 @@ import ast
 import unittest
 from pathlib import Path
 
-# Modules that can move bytes off the machine. If the on-device core imports
-# any of these (directly or via another core module), the local-first
-# guarantee is broken.
+# Modules that can move bytes off the machine — directly (network) or via an
+# escape hatch (spawning a process, calling foreign code). If the on-device
+# core imports any of these (directly or via another core module), the
+# local-first guarantee is broken.
 _FORBIDDEN = {
     "socket", "ssl", "urllib", "http", "ftplib", "smtplib", "poplib",
     "imaplib", "telnetlib", "asyncio", "requests", "httpx", "aiohttp",
     "urllib3", "websocket", "websockets", "grpc", "paramiko", "boto3",
-    "xmlrpc", "webbrowser",
+    "xmlrpc", "webbrowser", "subprocess", "ctypes",
 }
 
 _CORE_DIR = Path(__file__).resolve().parent.parent / "utety" / "core"

@@ -37,6 +37,31 @@ class TestLearners(unittest.TestCase):
         with self.assertRaises(StoreError):
             self.s.set_consent("ghost", "granted")
 
+    def test_revocation_keeps_a_timestamp(self):
+        # Audit B2: erasing WHEN consent was withdrawn guts the audit trail.
+        self.s.add_learner("kid1", "Neva")
+        self.s.set_consent("kid1", "granted", granted_by="parent:sean")
+        self.s.set_consent("kid1", "revoked", granted_by="parent:sean")
+        row = self.s.get_learner("kid1")
+        self.assertEqual(row["consent_status"], "revoked")
+        self.assertIsNotNone(row["consent_at"])
+
+    def test_consent_transitions_enter_the_disclosure_chain(self):
+        # Audit B2: consent history must be tamper-evident, not a mutable cell.
+        self.s.add_learner("kid1", "Neva")
+        self.s.set_consent("kid1", "granted", granted_by="parent:sean")
+        self.s.set_consent("kid1", "revoked", granted_by="parent:sean")
+        changes = [r for r in self.s.disclosure_log("kid1")
+                   if r["kind"] == "consent_changed"]
+        self.assertEqual([c["payload"]["status"] for c in changes],
+                         ["granted", "revoked"])
+        self.assertTrue(self.s.verify_disclosure_chain())
+
+    def test_duplicate_learner_raises_store_error(self):
+        self.s.add_learner("kid1", "Neva")
+        with self.assertRaises(StoreError):
+            self.s.add_learner("kid1", "Neva again")
+
 
 class TestOutcomesAndMastery(unittest.TestCase):
     def setUp(self):
@@ -135,9 +160,43 @@ class TestDisclosureChain(unittest.TestCase):
         self.s._db.commit()
         self.assertFalse(self.s.verify_disclosure_chain())
 
+    def test_tail_truncation_is_detected(self):
+        # Audit B4: deleting the NEWEST rows used to leave a chain that still
+        # verified. The anchored head catches it now.
+        for i in range(3):
+            self.s.log_disclosure("kid1", "feedback_given", payload={"n": i})
+        self.assertTrue(self.s.verify_disclosure_chain())
+        self.s._db.execute("DELETE FROM disclosure WHERE seq = 3")
+        self.s._db.commit()
+        self.assertFalse(self.s.verify_disclosure_chain())
+
+    def test_empty_chain_with_no_anchor_verifies(self):
+        self.assertTrue(Store(":memory:").verify_disclosure_chain())
+
     def test_disclosure_requires_known_learner(self):
         with self.assertRaises(StoreError):
             self.s.log_disclosure("ghost", "item_presented")
+
+
+class TestSchemaVersion(unittest.TestCase):
+    def test_newer_schema_refused(self):
+        # Audit B6: opening a store written by newer code must fail loudly,
+        # not proceed blindly over an unknown layout.
+        import os
+        import tempfile
+
+        fd, path = tempfile.mkstemp(suffix=".utety.db")
+        os.close(fd)
+        try:
+            s = Store(path)
+            s._db.execute(
+                "UPDATE meta SET value = '999' WHERE key = 'schema_version'")
+            s._db.commit()
+            s.close()
+            with self.assertRaises(StoreError):
+                Store(path)
+        finally:
+            os.unlink(path)
 
 
 class TestPersistence(unittest.TestCase):

@@ -211,3 +211,22 @@ explicit localhost exception for development if needed).
 
 *Filed as `docs/full-audit-2026-07-13.md`. Five confirmed defects, none architectural;
 the load-bearing ideas held. The mountain is, once again, a punch-list.*
+
+## Outcome (same day, on this branch)
+
+- **A1–A5**: all fixed with regression tests (A1 with the CI matrix that would
+  have caught it; A2 also hardened at the web layer — see the bite-4 audit).
+- **B1**: resolved by bite 4's architecture (server-side rendering; the answer
+  key never leaves the process).
+- **B2**: consent transitions timestamped in every state and appended to the
+  tamper-evident disclosure chain (`kind="consent_changed"`).
+- **B3**: prose aligned with enforcement; `subprocess`/`ctypes` added to both
+  the core scan and the package-wide boundary test.
+- **B4**: chain head anchored in `meta` on every append; tail truncation now
+  fails `verify_disclosure_chain` (proved by test).
+- **B5**: transport refuses non-https endpoints.
+- **B6**: duplicate learner/skill raise `StoreError`; newer-schema stores are
+  refused on open; `register_course` propagates re-fitted BKT params (content,
+  not learner state).
+- **Open**: code LICENSE (project decision for Sean); FSRS spaced review
+  (Phase-1 feature work, not a defect); Phase-2 consent *enforcement*.
