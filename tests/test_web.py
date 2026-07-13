@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for utety/web — render fragments and the pure App router."""
 import re
+import typing
 import unittest
 
 from utety.content.courses import build_neva_and_theo
@@ -111,9 +112,10 @@ class TestAppRouting(unittest.TestCase):
 
 
 class TestFullPlaythroughOverHTTP(unittest.TestCase):
-    BODY = {"ip1": "response=a", "ip2": "response=false", "ip3": "response=a",
-            "lf1": "response=arm&response=fulcrum&response=load",
-            "lf2": "response=a", "lf3": "response=a"}
+    BODY: typing.ClassVar[dict] = {
+        "ip1": "response=a", "ip2": "response=false", "ip3": "response=a",
+        "lf1": "response=arm&response=fulcrum&response=load",
+        "lf2": "response=a", "lf3": "response=a"}
 
     def test_plays_to_completion_through_the_router(self):
         app = App(Store(":memory:"), build_neva_and_theo())

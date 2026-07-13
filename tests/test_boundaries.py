@@ -38,11 +38,18 @@ _NETWORK = {
     "xmlrpc", "webbrowser", "subprocess", "ctypes",
 }
 
-# The ONLY modules allowed to reach the network. Paths relative to utety/.
-# Growing this list is a privacy decision — treat an edit here like an edit
-# to the consent gate.
+# The ONLY modules allowed to import network-capable libraries. Paths relative
+# to utety/. Growing this list is a privacy decision — treat an edit here like
+# an edit to the consent gate, and record the reviewed reason inline.
 _EGRESS_ALLOWED = {
+    # The seam: the one true egress path (de-identified concept queries out,
+    # sourced cards back). Audited 2026-07-13.
     "knowledge.py",
+    # The reading-room server: http.server LISTENER + urllib.parse only — it
+    # accepts loopback connections, it does not originate any. Its default
+    # bind is pinned to 127.0.0.1 by TestLocalFirstBinding below; audited
+    # 2026-07-13 (docs/audit-bite-4-web-2026-07-13.md).
+    "web/server.py",
 }
 
 
@@ -89,6 +96,23 @@ class TestSeamIsTheOnlyDoor(unittest.TestCase):
                 (_PKG_DIR / rel).is_file(),
                 f"_EGRESS_ALLOWED entry {rel!r} does not exist — update the list",
             )
+
+
+class TestLocalFirstBinding(unittest.TestCase):
+    def test_reading_room_binds_loopback_by_default(self):
+        # The student front must not be reachable from the LAN. serve()'s
+        # default host is part of the privacy posture: changing it to
+        # "0.0.0.0" (or "") exposes a child's tutor to the network and must
+        # be a reviewed decision, not a default drift.
+        import inspect
+
+        from utety.web.server import serve
+
+        default_host = inspect.signature(serve).parameters["host"].default
+        self.assertEqual(
+            default_host, "127.0.0.1",
+            "the reading room's default bind must stay loopback-only",
+        )
 
 
 class TestStdlibOnly(unittest.TestCase):

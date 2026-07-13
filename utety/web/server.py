@@ -102,8 +102,11 @@ class App:
                 cards = self.seam.back(result.source_query)
                 if cards:
                     return cards
-            except Exception:
-                pass  # offline / no endpoint — fall through to the local citation
+            except Exception:  # noqa: S110 — deliberate: offline/no-endpoint falls
+                # through to the local citation so Rule 1 holds without a network.
+                # Known gap: failures are invisible (audit bite-4, smaller notes);
+                # route seam errors to the disclosure spine in the W-fix round.
+                pass
         return [SourcedCard(source=result.citation, snippet="", confidence="")]
 
 
