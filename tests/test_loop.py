@@ -121,6 +121,59 @@ class TestAnswerAndFeedback(unittest.TestCase):
         self.assertEqual(after["opportunities"], 1)
 
 
+class TestNoFalseComplete(unittest.TestCase):
+    def test_blocked_skill_falls_through_to_next_instead_of_completing(self):
+        # Audit A5: if the preferred skill has nothing selectable right now
+        # (its items gated on ANOTHER skill's experience), the loop used to
+        # report "complete" while unmastered work remained. It must fall
+        # through and surface the gate instead.
+        from utety.content.model import Course, Experience, Item, Skill
+
+        sk_a = Skill("s.a", "science", "A")
+        sk_b = Skill("s.b", "science", "B", bkt={"prior": 0.1, "learn": 0.15,
+                                                 "guess": 0.25, "slip": 0.1,
+                                                 "forget": 0.0})
+        exp_a = Experience("exp.a", ["s.a"], "do A", "hands first")
+        course = Course(
+            "c", "t", "3-5", "science",
+            skills=[sk_a, sk_b],
+            experiences=[exp_a],
+            items=[
+                Item("ia", "s.a", "single", "?", answer="a",
+                     choices={"a": "A"}, requires_experience="exp.a"),
+                # B's item is gated on A's experience: B is preferred (lower
+                # prior) but has nothing selectable until exp.a is done.
+                Item("ib", "s.b", "single", "?", answer="a",
+                     choices={"a": "A"}, requires_experience="exp.a"),
+            ],
+        )
+        store = Store(":memory:")
+        register_course(store, course)
+        store.add_learner("kid1", "Theo")
+        sess = LessonSession(store, course, "kid1")
+
+        step = sess.next_step()
+        self.assertEqual(step.kind, "experience",
+                         "loop must surface the blocking gate, not complete")
+        self.assertEqual(step.experience.id, "exp.a")
+        self.assertFalse(sess.is_complete())
+
+
+class TestMalformedResponse(unittest.TestCase):
+    def test_garbage_boolean_response_records_no_outcome(self):
+        # Audit A2 at loop level: a malformed response must raise BEFORE any
+        # outcome is recorded — never feed noise into the mastery signal.
+        store, course = _fresh()
+        sess = LessonSession(store, course, "kid1")
+        sess.acknowledge_experience("exp.ramp")
+        with self.assertRaises(ValueError):
+            sess.answer("ip2", "banana")
+        self.assertEqual(
+            store.outcome_history("kid1", "sci.3-5.inclined-plane"), [],
+            "malformed response must not create a practice opportunity",
+        )
+
+
 class TestDisclosure(unittest.TestCase):
     def test_answers_and_acks_are_logged_and_chained(self):
         store, course = _fresh()

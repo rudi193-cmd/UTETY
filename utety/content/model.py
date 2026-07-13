@@ -98,12 +98,21 @@ class Item:
 
     # ── auto-checking (deterministic, on-device) ───────────────────────────
     def check(self, response) -> bool:
-        """True iff ``response`` is correct. Deterministic; no model call."""
+        """True iff ``response`` is correct. Deterministic; no model call.
+
+        Raises ValueError on a malformed response (free text to a boolean item,
+        a bare string to a multi item): a malformed response is a front-end bug,
+        and grading it would feed a spurious 0/1 into the mastery signal.
+        """
         if self.kind == "single":
             return response == self.answer
         if self.kind == "boolean":
             return _coerce_bool(response) == bool(self.answer)
         if self.kind == "multi":
+            if isinstance(response, (str, bytes)) or not hasattr(response, "__iter__"):
+                raise ValueError(
+                    f"multi item expects a collection of choice ids, got {response!r}"
+                )
             return set(response) == set(self.answer)
         if self.kind == "text":
             accepted = self.answer if isinstance(self.answer, (list, tuple, set)) else [self.answer]
@@ -167,6 +176,12 @@ class Course:
                 raise ValueError(
                     f"item {it.id!r} gated on unknown experience {it.requires_experience!r}"
                 )
+        # Every skill needs at least one item: BKT mastery only moves on item
+        # outcomes, so an item-less skill can never be mastered and would leave
+        # the course permanently incompletable (audit 2026-07-13, A5).
+        itemless = skill_ids - {i.skill_id for i in self.items}
+        if itemless:
+            raise ValueError(f"skills have no items (unmasterable): {sorted(itemless)}")
 
     # ── lookups the loop uses ──────────────────────────────────────────────
     def items_for(self, skill_id: str) -> list[Item]:
@@ -180,7 +195,14 @@ class Course:
 
     # ── serialization ──────────────────────────────────────────────────────
     def to_dict(self) -> dict:
-        return asdict(self)
+        """A JSON-serializable dict. Multi answers (sets) become sorted lists;
+        ``check`` compares set-wise, so the round-trip is behavior-preserving
+        (audit 2026-07-13, A3)."""
+        d = asdict(self)
+        for it in d["items"]:
+            if isinstance(it["answer"], (set, frozenset)):
+                it["answer"] = sorted(it["answer"])
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "Course":
@@ -195,9 +217,24 @@ class Course:
         )
 
 
+_TRUE_TOKENS = frozenset(("true", "t", "yes", "y", "1"))
+_FALSE_TOKENS = frozenset(("false", "f", "no", "n", "0"))
+
+
 def _coerce_bool(response) -> bool:
+    """Coerce a boolean-item response; raise on anything unrecognizable.
+
+    Anything outside the explicit true/false token sets is a malformed
+    response, NOT a "false" — mapping garbage to False silently graded any
+    nonsense as correct on answer=False items (audit 2026-07-13, A2).
+    """
     if isinstance(response, bool):
         return response
     if isinstance(response, (int, float)):
         return bool(response)
-    return _normalize_text(response) in ("true", "t", "yes", "y", "1")
+    token = _normalize_text(response)
+    if token in _TRUE_TOKENS:
+        return True
+    if token in _FALSE_TOKENS:
+        return False
+    raise ValueError(f"boolean item expects true/false, got {response!r}")

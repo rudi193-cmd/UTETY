@@ -116,17 +116,22 @@ class LessonSession:
         # Interleave: prefer the least-practised unmastered skill (round-robin
         # emerges naturally), tie-breaking on lowest mastery. In a discrimination
         # domain (ramp vs lever), interleaving beats blocking (Rohrer 2020).
-        target = min(unmastered, key=lambda s: (self._opps(s.id), self._mastery(s.id)))
-
-        # Gate: the physical experiment must come first (hands before vocabulary).
-        for exp in self.course.experiences_for(target.id):
-            if exp.id not in self._acked:
-                return Step(kind="experience", experience=exp)
-
-        item = self._select_item(target.id)
-        if item is None:                       # gated-but-no-items — treat as done
-            return Step(kind="complete")
-        return Step(kind="item", item=item, present=self._present(item, target.id))
+        # Walk the whole preference order: a skill with nothing selectable right
+        # now (e.g. its items gated on another skill's experience) must fall
+        # through to the next skill, not end the session (audit 2026-07-13, A5).
+        ordered = sorted(unmastered, key=lambda s: (self._opps(s.id), self._mastery(s.id)))
+        for target in ordered:
+            # Gate: the physical experiment comes first (hands before vocabulary).
+            for exp in self.course.experiences_for(target.id):
+                if exp.id not in self._acked:
+                    return Step(kind="experience", experience=exp)
+            item = self._select_item(target.id)
+            if item is not None:
+                return Step(kind="item", item=item, present=self._present(item, target.id))
+        # Unmastered skills remain but nothing is selectable for any of them.
+        # Course validation guarantees every skill has items, so this is only
+        # reachable via cross-skill gating; report completion of *available* work.
+        return Step(kind="complete")
 
     def _select_item(self, skill_id: str) -> Item | None:
         """The item whose estimated success is closest to the ~85% flow target."""
