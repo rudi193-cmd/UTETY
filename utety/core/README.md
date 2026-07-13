@@ -19,10 +19,12 @@ query* to the library, built later as an explicit spine.
 
 Student data stays on-device unless an optional, consented sync is *explicitly*
 enabled later. This is enforced **structurally, not by policy**: the core
-imports no networking library, so there is no code path by which student PII
-can leave the device. `tests/test_no_egress.py` proves it two ways — an AST
-scan of every `utety/core/*.py`, and a subprocess check that importing the
-store loads no network module into `sys.modules`.
+imports no networking library and no process/FFI escape hatch, and tests keep
+it that way. `tests/test_no_egress.py` proves it two ways — an AST scan of
+every `utety/core/*.py`, and a subprocess check that importing the store loads
+no network-capable module into `sys.modules` — and `tests/test_boundaries.py`
+extends the ban (including `subprocess`/`ctypes`) to the whole package, with
+the knowledge seam as the single allowlisted door.
 
 **When the consented-sync spine is built, it must live OUTSIDE `utety/core/`**
 so this guarantee continues to hold for the store.

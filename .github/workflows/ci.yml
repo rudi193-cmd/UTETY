@@ -1,0 +1,79 @@
+# UTETY CI — see docs/ci.md for the design and how to extend it per phase.
+#
+# Reliability posture:
+#   * fail-fast: false — one broken matrix cell must not hide the others
+#     (the audit's A1 was version-specific; seeing the FULL matrix is the point).
+#   * Tool versions pinned exactly — a lint release must never break CI.
+#   * Every job is required; there are no advisory-only checks. A check that
+#     can be ignored trains people to ignore checks.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests · py${{ matrix.python }} · ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Version spread catches stdlib behavior drift (audit A1: pathlib
+        # imports urllib.parse on 3.11/3.12 but not 3.13+). Windows guards the
+        # Termux/Windows-parity ground rule from the build plan.
+        os: [ubuntu-latest]
+        python: ["3.11", "3.12", "3.13"]
+        include:
+          - os: windows-latest
+            python: "3.13"
+          - os: windows-latest
+            python: "3.11"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit + policy tests
+        run: python -m unittest discover -s tests -v
+      - name: Same suite under -O
+        # Asserts are stripped under -O. Safety/privacy controls must not live
+        # in asserts (audit A4) — proving the suite holds optimized keeps that
+        # class of regression from ever landing silently.
+        run: python -O -m unittest discover -s tests
+
+  lint:
+    name: ruff (correctness + security gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      # Pinned exactly: a new ruff release adding rules must not redden CI.
+      # Bump deliberately, with the diff of new findings in the same PR.
+      - run: pip install ruff==0.15.8
+      - run: ruff check --output-format=github .
+
+  coverage:
+    name: coverage floor (90%)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install coverage==7.15.1
+      - name: Run suite under coverage and enforce the floor
+        # Floor, not target: currently ~94%. New modules landing without tests
+        # drag the total below 90 and fail here. Raise the floor as coverage
+        # rises; never lower it to make a PR pass.
+        run: |
+          python -m coverage run -m unittest discover -s tests
+          python -m coverage report --include='utety/*' --fail-under=90

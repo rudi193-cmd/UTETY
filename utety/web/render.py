@@ -20,13 +20,14 @@ _PERSONA_NAME = "Hanz"
 
 
 # ── the page shell (loaded once; #stage is swapped by the JS island) ───────────
-def page_shell(course: Course, learner: str) -> str:
+def page_shell(course: Course, learner: str, csrf: str = "") -> str:
     q = escape(learner)
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf" content="{escape(csrf)}">
 <title>{escape(course.title)} · UTETY</title>
 <style>{_CSS}</style>
 </head>
@@ -67,15 +68,18 @@ def experience_fragment(exp: Experience, learner: str) -> str:
 
 
 # ── a retrieval item (answer hidden; scaffold only for novices) ────────────────
-def item_fragment(present: Presentation, item: Item, learner: str) -> str:
+def item_fragment(present: Presentation, item: Item, learner: str,
+                  nudge: str = "") -> str:
     q = escape(learner)
     scaffold = ""
     if present.scaffold:
         scaffold = f'<p class="scaffold">{escape(present.scaffold)}</p>'
+    nudge_html = f'<p class="nudge">{escape(nudge)}</p>' if nudge else ""
     return f"""<section class="card item">
   <span class="eyebrow">Now, what did you notice?</span>
   <form data-post="/answer?learner={q}&amp;item={escape(item.id)}">
     <p class="prompt">{escape(present.prompt)}</p>
+    {nudge_html}
     {scaffold}
     <div class="choices">{_choices_html(item, present)}</div>
     <button class="primary" type="submit">Check</button>
@@ -132,8 +136,11 @@ def card_html(card: SourcedCard) -> str:
     title = escape(card.source or "source")
     snippet = escape(card.snippet or "")
     date = f'<span class="date">{escape(card.date)}</span>' if card.date else ""
+    # Cards are external input (the seam returns them). html.escape neutralizes
+    # markup but not URL schemes — link only https, or a hostile backend could
+    # hand the child a javascript: link (audit bite-4, W3).
     link = (f'<a href="{escape(card.url)}" target="_blank" rel="noopener">check the source</a>'
-            if card.url else "")
+            if card.url.startswith("https://") else "")
     return f"""<article class="sourced">
     <span class="corner tl"></span><span class="corner tr"></span>
     <span class="corner bl"></span><span class="corner br"></span>
@@ -167,6 +174,7 @@ def complete_fragment(progress: dict, course: Course) -> str:
 # enclosing <form> if present) and swaps the response into #stage. Real htmx
 # (~14kb) can replace this drop-in later without touching the fragments.
 _ISLAND = r"""
+const CSRF = (document.querySelector('meta[name="csrf"]') || {}).content || '';
 document.addEventListener('click', async (e) => {
   const el = e.target.closest('[data-post]');
   if (!el) return;
@@ -179,7 +187,8 @@ document.addEventListener('click', async (e) => {
   }
   const res = await fetch(el.getAttribute('data-post'), {
     method: 'POST',
-    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+    headers: {'Content-Type': 'application/x-www-form-urlencoded',
+              'X-Utety-Csrf': CSRF},
     body,
   });
   const html = await res.text();
@@ -212,6 +221,7 @@ h2 { margin:.1rem 0 .6rem; }
 .hanz { font-style:italic; color:#5a5040; }
 .scaffold { background:#fdf6e6; border-left:3px solid var(--gold);
   padding:.5rem .8rem; margin:.6rem 0; font-size:.94rem; }
+.nudge { color:var(--rust); font-style:italic; margin:.3rem 0 .6rem; }
 .prompt { font-size:1.08rem; margin:.2rem 0 .8rem; }
 .choices { display:flex; flex-direction:column; gap:.5rem; margin-bottom:1rem; }
 .choice { display:flex; gap:.55rem; align-items:flex-start; padding:.55rem .7rem;

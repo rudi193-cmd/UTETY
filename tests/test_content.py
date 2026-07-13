@@ -3,7 +3,7 @@
 import unittest
 
 from utety.content.courses import build_neva_and_theo
-from utety.content.model import Course, Experience, Item, Skill
+from utety.content.model import Course, Item, Skill
 from utety.content.register import register_course
 from utety.core.store import Store
 
@@ -21,6 +21,27 @@ class TestItemChecking(unittest.TestCase):
         self.assertTrue(it.check(False))
         self.assertFalse(it.check("true"))
         self.assertFalse(it.check(1))
+
+    def test_boolean_accepts_explicit_false_tokens(self):
+        it = Item("i2b", "s", "boolean", "t/f", answer=False)
+        for token in ("false", "f", "no", "n", "0", "NO", " False "):
+            self.assertTrue(it.check(token), f"{token!r} should read as false")
+
+    def test_boolean_rejects_garbage_instead_of_grading_it(self):
+        # Audit A2: unrecognized text used to coerce to False, so answer=False
+        # items graded any nonsense as correct and inflated mastery.
+        it = Item("i2c", "s", "boolean", "t/f", answer=False)
+        for garbage in ("banana", "maybe", "", "truthy"):
+            with self.assertRaises(ValueError, msg=f"{garbage!r} must not grade"):
+                it.check(garbage)
+
+    def test_multi_rejects_bare_string(self):
+        # A string would silently iterate into characters ({'a','r','m'}).
+        it = Item("i3b", "s", "multi", "which", answer={"arm", "fulcrum"})
+        with self.assertRaises(ValueError):
+            it.check("arm")
+        with self.assertRaises(ValueError):
+            it.check(42)
 
     def test_multi_is_order_independent(self):
         it = Item("i3", "s", "multi", "which", answer={"arm", "fulcrum", "load"})
@@ -78,12 +99,32 @@ class TestCourseValidation(unittest.TestCase):
             Course("c", "t", "3-5", "science",
                    skills=[Skill("s1", "science", "A"), Skill("s1", "science", "B")])
 
+    def test_skill_with_no_items_rejected(self):
+        # Audit A5: an item-less skill can never be mastered, so it would leave
+        # the course permanently incompletable. Refuse it at authoring time.
+        with self.assertRaises(ValueError):
+            Course("c", "t", "3-5", "science",
+                   skills=[Skill("s1", "science", "Has items"),
+                           Skill("s2", "science", "No items")],
+                   items=[Item("i", "s1", "single", "?", answer="a")])
+
     def test_roundtrip_dict(self):
         course = build_neva_and_theo()
         rebuilt = Course.from_dict(course.to_dict())
         self.assertEqual(rebuilt.id, course.id)
         self.assertEqual(len(rebuilt.items), len(course.items))
         self.assertEqual(rebuilt.items[0].check("a"), course.items[0].check("a"))
+
+    def test_roundtrip_through_actual_json(self):
+        # Audit A3: to_dict claimed JSON-serializable but multi answers were
+        # sets. The contract is now proven through json itself.
+        import json
+
+        course = build_neva_and_theo()
+        rebuilt = Course.from_dict(json.loads(json.dumps(course.to_dict())))
+        multi = next(i for i in rebuilt.items if i.kind == "multi")
+        self.assertTrue(multi.check(["load", "arm", "fulcrum"]))
+        self.assertFalse(multi.check(["arm", "fulcrum"]))
 
 
 class TestNevaAndTheoCourse(unittest.TestCase):
@@ -150,6 +191,18 @@ class TestRegistration(unittest.TestCase):
             register_course(s, course)
             added_again = register_course(s, course)
             self.assertEqual(added_again, [])
+
+    def test_register_updates_changed_params(self):
+        # Audit B6: re-fitted BKT params shipped with a course update must
+        # reach stores that registered the older version.
+        course = build_neva_and_theo()
+        with Store(":memory:") as s:
+            register_course(s, course)
+            updated = build_neva_and_theo()
+            updated.skills[0].bkt = dict(updated.skills[0].bkt, learn=0.33)
+            register_course(s, updated)
+            self.assertAlmostEqual(
+                s.get_skill(updated.skills[0].id)["learn"], 0.33)
 
     def test_registered_skill_drives_the_store_loop(self):
         # End-to-end: register content, then record outcomes against a real skill.

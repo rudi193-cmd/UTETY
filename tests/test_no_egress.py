@@ -15,14 +15,15 @@ import ast
 import unittest
 from pathlib import Path
 
-# Modules that can move bytes off the machine. If the on-device core imports
-# any of these (directly or via another core module), the local-first
-# guarantee is broken.
+# Modules that can move bytes off the machine — directly (network) or via an
+# escape hatch (spawning a process, calling foreign code). If the on-device
+# core imports any of these (directly or via another core module), the
+# local-first guarantee is broken.
 _FORBIDDEN = {
     "socket", "ssl", "urllib", "http", "ftplib", "smtplib", "poplib",
     "imaplib", "telnetlib", "asyncio", "requests", "httpx", "aiohttp",
     "urllib3", "websocket", "websockets", "grpc", "paramiko", "boto3",
-    "xmlrpc", "webbrowser",
+    "xmlrpc", "webbrowser", "subprocess", "ctypes",
 }
 
 _CORE_DIR = Path(__file__).resolve().parent.parent / "utety" / "core"
@@ -48,7 +49,7 @@ class TestNoEgress(unittest.TestCase):
         self.assertTrue(core_files, "no core modules found to audit")
         offenders = {}
         for f in core_files:
-            imported = _imported_modules(f.read_text())
+            imported = _imported_modules(f.read_text(encoding="utf-8"))
             bad = imported & _FORBIDDEN
             if bad:
                 offenders[f.name] = sorted(bad)
@@ -61,14 +62,20 @@ class TestNoEgress(unittest.TestCase):
 
     def test_importing_store_does_not_load_network_modules(self):
         # Beyond static analysis: importing the store in a subprocess must not
-        # pull a network module into sys.modules through any transitive path.
+        # pull a network-CAPABLE module into sys.modules through any transitive
+        # path. Checked at full module-name granularity: on Python 3.11/3.12 the
+        # stdlib's own pathlib imports urllib.parse (pure string manipulation,
+        # cannot move bytes), so forbidding the top-level 'urllib' name would
+        # fail on stdlib behavior, not on anything the core does. The modules
+        # that can actually open a connection are listed exactly.
         import subprocess
         import sys
 
         code = (
             "import sys; import utety.core.store; "
-            "net={'socket','ssl','urllib','http','requests','httpx','aiohttp'};"
-            "loaded=net & set(m.split('.')[0] for m in sys.modules);"
+            "net={'socket','ssl','urllib.request','urllib.error','http.client',"
+            "'ftplib','smtplib','poplib','imaplib','requests','httpx','aiohttp'};"
+            "loaded=net & set(sys.modules);"
             "print(','.join(sorted(loaded)))"
         )
         repo_root = str(Path(__file__).resolve().parent.parent)

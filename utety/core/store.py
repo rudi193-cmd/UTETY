@@ -9,10 +9,11 @@ local disclosure log ("what the tutor discussed with your child").
 NON-NEGOTIABLE — Ground rule 3 (local-first by default): student data stays
 on-device unless an optional, consented sync is *explicitly* enabled later.
 This module enforces that STRUCTURALLY, not by policy: it imports no
-networking library (no urllib, socket, http, requests, ...). There is no code
-path here by which student PII can leave the device. The consented-sync spine,
-when it is built, will be a *separate* module that reads from this one — never
-a capability of the store itself.
+networking library (no urllib, socket, http, requests, ...) and no process/
+FFI escape hatch (subprocess, ctypes), and the boundary tests enforce exactly
+that (tests/test_no_egress.py for this package; tests/test_boundaries.py
+repo-wide). The consented-sync spine, when it is built, will be a *separate*
+module that reads from this one — never a capability of the store itself.
 
 Everything is stdlib. No numpy/pandas/ORM — Termux/Windows parity, and small
 enough to audit in one sitting.
@@ -144,6 +145,18 @@ class Store:
             (str(SCHEMA_VERSION),),
         )
         self._db.commit()
+        # Refuse a store written by a NEWER schema: proceeding blindly could
+        # corrupt a child's data. Older versions migrate here when migrations
+        # exist (audit 2026-07-13, B6).
+        found = int(self._db.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()["value"])
+        if found > SCHEMA_VERSION:
+            self._db.close()
+            raise StoreError(
+                f"store schema v{found} is newer than this code (v{SCHEMA_VERSION}) "
+                "— update UTETY before opening this store"
+            )
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def close(self) -> None:
@@ -158,11 +171,14 @@ class Store:
     # ── learners ───────────────────────────────────────────────────────────
     def add_learner(self, learner_id: str, display_name: str,
                     birth_year: int | None = None) -> None:
-        self._db.execute(
-            "INSERT INTO learners(id, display_name, birth_year, created_at) "
-            "VALUES(?, ?, ?, ?)",
-            (learner_id, display_name, birth_year, _now()),
-        )
+        try:
+            self._db.execute(
+                "INSERT INTO learners(id, display_name, birth_year, created_at) "
+                "VALUES(?, ?, ?, ?)",
+                (learner_id, display_name, birth_year, _now()),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise StoreError(f"learner already exists: {learner_id!r}") from exc
         self._db.commit()
 
     def get_learner(self, learner_id: str) -> dict | None:
@@ -183,6 +199,11 @@ class Store:
 
         status: 'pending' | 'granted' | 'revoked'. The store persists it; the
         Phase-2 age-gate is what *enforces* it before any child uses the tutor.
+
+        Every transition is timestamped (revocation included — erasing *when*
+        consent was withdrawn would gut the audit trail) and appended to the
+        tamper-evident disclosure chain, so the consent history is inspectable
+        and unforgeable after the fact (audit 2026-07-13, B2).
         """
         if status not in ("pending", "granted", "revoked"):
             raise StoreError(f"invalid consent status: {status!r}")
@@ -191,19 +212,41 @@ class Store:
         self._db.execute(
             "UPDATE learners SET consent_status = ?, consent_by = ?, consent_at = ? "
             "WHERE id = ?",
-            (status, granted_by, _now() if status == "granted" else None, learner_id),
+            (status, granted_by, _now(), learner_id),
         )
         self._db.commit()
+        self.log_disclosure(
+            learner_id, "consent_changed",
+            payload={"status": status, "by": granted_by},
+        )
 
     # ── skills ─────────────────────────────────────────────────────────────
     def add_skill(self, skill_id: str, subject: str, name: str,
                   standard: str | None = None,
                   params: BKTParams | None = None) -> None:
         p = params or BKTParams()
+        try:
+            self._db.execute(
+                "INSERT INTO skills(id, subject, name, standard, prior, learn, guess, slip, forget) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (skill_id, subject, name, standard, p.prior, p.learn, p.guess, p.slip, p.forget),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise StoreError(f"skill already exists: {skill_id!r}") from exc
+        self._db.commit()
+
+    def update_skill_params(self, skill_id: str, params: BKTParams) -> None:
+        """Replace a skill's BKT parameters (content, not learner state).
+
+        Used when upstream ships re-fitted values; mastery rows are untouched —
+        the new parameters simply govern updates from here on.
+        """
+        if self.get_skill(skill_id) is None:
+            raise StoreError(f"unknown skill: {skill_id!r}")
         self._db.execute(
-            "INSERT INTO skills(id, subject, name, standard, prior, learn, guess, slip, forget) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (skill_id, subject, name, standard, p.prior, p.learn, p.guess, p.slip, p.forget),
+            "UPDATE skills SET prior = ?, learn = ?, guess = ?, slip = ?, forget = ? "
+            "WHERE id = ?",
+            (params.prior, params.learn, params.guess, params.slip, params.forget, skill_id),
         )
         self._db.commit()
 
@@ -325,6 +368,15 @@ class Store:
             "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
             (next_seq, learner_id, kind, payload_json, citation, now, prev_hash, row_hash),
         )
+        # Anchor the head: an edit or mid-chain delete breaks the hash links,
+        # but deleting the NEWEST rows would otherwise leave a chain that still
+        # verifies. Persisting head+count on every append makes truncation
+        # detectable too (audit 2026-07-13, B4).
+        self._db.execute(
+            "INSERT INTO meta(key, value) VALUES('disclosure_head', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (json.dumps({"hash": row_hash, "count": next_seq}),),
+        )
         self._db.commit()
         return row_hash
 
@@ -347,7 +399,12 @@ class Store:
         return out
 
     def verify_disclosure_chain(self) -> bool:
-        """Recompute the device-wide hash chain; True iff intact."""
+        """Recompute the device-wide hash chain; True iff intact.
+
+        Checks both directions of tamper: rewritten/deleted middle rows (the
+        hash links break) and deleted tail rows (the last row no longer matches
+        the anchored head in ``meta``).
+        """
         rows = self._db.execute(
             "SELECT seq, learner_id, kind, payload, citation, created_at, prev_hash, hash "
             "FROM disclosure ORDER BY seq"
@@ -363,7 +420,15 @@ class Store:
             if expect != r["hash"]:
                 return False
             prev_hash = r["hash"]
-        return True
+        anchor_row = self._db.execute(
+            "SELECT value FROM meta WHERE key = 'disclosure_head'"
+        ).fetchone()
+        if not rows:
+            return anchor_row is None
+        if anchor_row is None:
+            return False
+        anchor = json.loads(anchor_row["value"])
+        return anchor["hash"] == rows[-1]["hash"] and anchor["count"] == rows[-1]["seq"]
 
 
 def skill_params_dict(params: BKTParams) -> dict:

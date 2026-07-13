@@ -30,7 +30,7 @@ import json
 import os
 import re
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Protocol
 
 # ── de-identification (vendored, compact; primary control is structural) ───────
@@ -92,13 +92,17 @@ def _http_transport(url: str, payload: dict) -> dict:
     Rides WILLOW_UTETY_SECRET (the `utety` app credential). The willow-mcp
     egress gate authorizes the send by UTETY's app_id + integration_net grant.
     """
+    # HTTPS only: the app secret rides a header, and a plaintext scheme (typo
+    # or hostile env var) would leak it on the wire (audit 2026-07-13, B5).
+    if not url.startswith("https://"):
+        raise RuntimeError(f"knowledge endpoint must be https, got: {url!r}")
     body = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json", "User-Agent": "utety/knowledge"}
     secret = os.environ.get("WILLOW_UTETY_SECRET")
     if secret:
         headers["X-Utety-Secret"] = secret
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=30) as resp:   # noqa: S310 (own identity, gated)
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")  # noqa: S310 (https enforced above)
+    with urllib.request.urlopen(req, timeout=30) as resp:   # noqa: S310 (https enforced above; own identity, gated)
         return json.loads(resp.read())
 
 
@@ -124,7 +128,10 @@ class KnowledgeSeam:
             )
         clean = deidentify(query)
         # Belt-and-suspenders: never send a payload that still trips a scrubber.
-        assert not contains_pii(clean), "de-identification failed to clean the query"
+        # A real raise, not an assert — asserts are stripped under `python -O`,
+        # and a privacy control must not be optional (audit 2026-07-13, A4).
+        if contains_pii(clean):
+            raise RuntimeError("de-identification failed to clean the query")
         payload = {"query": clean}          # no learner field exists to add
         raw = self._transport(f"{self._base_url}/search", payload)
         cards = raw if isinstance(raw, list) else raw.get("cards", [])
