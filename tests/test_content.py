@@ -3,7 +3,7 @@
 import unittest
 
 from utety.content.courses import build_neva_and_theo
-from utety.content.model import Course, Experience, Item, Skill
+from utety.content.model import Course, Item, Skill
 from utety.content.register import register_course
 from utety.core.store import Store
 
