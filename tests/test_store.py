@@ -24,6 +24,31 @@ class _FailingDB:
         return getattr(self._real, name)
 
 
+class _FailingCommitDB:
+    """Proxy whose commit() raises ONCE — disk-full strikes exactly at commit,
+    where pages flush (final-loop audit 2026-07-14, S1)."""
+
+    def __init__(self, real):
+        self._real = real
+        self._fired = False
+
+    def commit(self):
+        if not self._fired:
+            self._fired = True
+            raise sqlite3.OperationalError("database or disk is full")
+        return self._real.commit()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class _FailingRollbackDB(_FailingDB):
+    """Write fails on the marker AND rollback fails too (S2's worst case)."""
+
+    def rollback(self):
+        raise sqlite3.OperationalError("rollback failed")
+
+
 class TestLearners(unittest.TestCase):
     def setUp(self):
         self.s = Store(":memory:")
@@ -180,6 +205,28 @@ class TestAtomicity(unittest.TestCase):
                          "consent flipped without its disclosure entry")
         self.assertEqual(self.s.disclosure_log("kid1"), [])
         self.assertTrue(self.s.verify_disclosure_chain())
+
+    def test_commit_failure_rolls_back_and_store_survives(self):
+        # Final-loop audit S1: a commit-time disk-full must roll back — not
+        # leave the transaction open, brick the handle, and expose phantom
+        # rows to reads. The SAME handle must keep working afterwards.
+        self.s._db = _FailingCommitDB(self.s._db)
+        with self.assertRaises(StoreError):
+            self.s.record_outcome("kid1", "sci.3-5.forces", correct=True)
+        self.assertEqual(
+            self.s.outcome_history("kid1", "sci.3-5.forces"), [],
+            "reads must not see uncommitted state after a failed commit")
+        p = self.s.record_outcome("kid1", "sci.3-5.forces", correct=True)
+        self.assertGreater(p, 0.0)
+        self.assertEqual(self.s.outcome_history("kid1", "sci.3-5.forces"), [1])
+
+    def test_rollback_failure_does_not_mask_the_original_error(self):
+        # Final-loop audit S2: if rollback itself fails, the caller must still
+        # see the ORIGINAL failure, not the rollback's.
+        self.s._db = _FailingRollbackDB(self.s._db, "INSERT INTO mastery")
+        with self.assertRaises(StoreError) as ctx:
+            self.s.record_outcome("kid1", "sci.3-5.forces", correct=True)
+        self.assertIn("simulated disk I/O error", str(ctx.exception.__cause__))
 
     def test_failed_disclosure_rolls_back_the_graded_answer(self):
         # F5 at loop level: an answer whose disclosure append fails must not

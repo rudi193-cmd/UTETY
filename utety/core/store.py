@@ -172,6 +172,11 @@ class Store:
         transaction — commit/rollback happen only at depth zero — so callers
         can compose semantically paired writes (an outcome and its disclosure
         row; a consent flip and its chain entry) into one atomic unit (F5).
+
+        Caution: a nested block is NOT independently atomic (no SAVEPOINTs) —
+        do not catch an inner block's exception and continue writing in the
+        outer transaction, or the inner block's partial writes will commit
+        with it (final-loop audit 2026-07-14, S3).
         """
         if self._tx_depth == 0:
             self._db.execute("BEGIN IMMEDIATE")
@@ -181,12 +186,25 @@ class Store:
         except BaseException:
             self._tx_depth -= 1
             if self._tx_depth == 0:
-                self._db.rollback()
+                # A failing rollback must not mask the original error (S2);
+                # the handle is torn either way, and the cause matters more.
+                with contextlib.suppress(Exception):
+                    self._db.rollback()
             raise
         else:
             self._tx_depth -= 1
             if self._tx_depth == 0:
-                self._db.commit()
+                try:
+                    self._db.commit()
+                except BaseException:
+                    # Commit is where pages flush, so disk-full strikes HERE.
+                    # Roll back so the transaction isn't left open — otherwise
+                    # this handle can never write again ("cannot start a
+                    # transaction within a transaction") and reads would see
+                    # uncommitted rows until close() (final-loop audit, S1).
+                    with contextlib.suppress(Exception):
+                        self._db.rollback()
+                    raise
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def close(self) -> None:
