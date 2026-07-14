@@ -89,6 +89,17 @@ class TestSeamStructuralPrivacy(unittest.TestCase):
         self.assertNotIn("@", seen["payload"]["query"])
 
 
+class TestTransportSchemeGuard(unittest.TestCase):
+    def test_http_transport_refuses_non_https(self):
+        # Independent audit F2: pins the B5 guard — the app secret and query
+        # must never ride a plaintext scheme. Raises before any network I/O.
+        from utety.knowledge import _http_transport
+
+        for url in ("http://x/search", "ftp://x/search", ""):
+            with self.assertRaises(RuntimeError, msg=url):
+                _http_transport(url, {"query": "q"})
+
+
 class TestSeamBehavior(unittest.TestCase):
     def test_parses_cards(self):
         def fake(url, payload):
@@ -115,6 +126,16 @@ class TestSeamBehavior(unittest.TestCase):
         seam = KnowledgeSeam(transport=lambda u, p: {}, base_url="")
         with self.assertRaises(RuntimeError):
             seam.back("q")
+
+    def test_non_dict_cards_from_hostile_backend_skipped(self):
+        # Independent audit N3: the backend is external input; junk entries
+        # must be dropped, not crash the seam.
+        seam = KnowledgeSeam(
+            transport=lambda u, p: {"cards": ["evil", 123, None, {"source": "ok"}]},
+            base_url="https://knowledge.utety")
+        cards = seam.back("q")
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0].source, "ok")
 
 
 class TestEndToEndWithLoop(unittest.TestCase):

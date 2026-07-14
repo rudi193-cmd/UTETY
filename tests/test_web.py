@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Tests for utety/web — render fragments and the pure App router."""
+"""Tests for utety/web — render fragments, the pure App router, and the real
+socket adapter (Host check, Content-Length handling — independent audit F2)."""
 import re
+import socket
+import threading
 import typing
 import unittest
+import urllib.error
+import urllib.request
 
 from utety.content.courses import build_neva_and_theo
 from utety.core.loop import Presentation, Result
 from utety.knowledge import KnowledgeSeam, SourcedCard
 from utety.core.store import Store
 from utety.web import render
-from utety.web.server import App
+from utety.web.server import App, serve
 
 
 def post(app: App, path: str, params: dict, body: str = ""):
@@ -160,6 +165,26 @@ class TestAbsenceIsNeverGraded(unittest.TestCase):
         self.assertEqual(
             self.app.store.outcome_history("kid1", "sci.3-5.lever-fulcrum"), [])
 
+    def test_out_of_set_single_not_graded(self):
+        # Independent audit F3: a value outside the choice set is not a wrong
+        # answer — it's a malformed request, and must not reach BKT.
+        status, _, html = post(self.app, "/answer",
+                               {"learner": ["kid1"], "item": ["ip1"]},
+                               "response=ZZZ_not_a_choice")
+        self.assertEqual(status, 200)
+        self.assertIn('class="card item"', html)
+        self.assertEqual(self._outcomes(), [])
+
+    def test_out_of_set_multi_not_graded(self):
+        post(self.app, "/step", {"learner": ["kid1"], "ack": ["exp.lever"]})
+        status, _, html = post(self.app, "/answer",
+                               {"learner": ["kid1"], "item": ["lf1"]},
+                               "response=nonsense1&response=nonsense2")
+        self.assertEqual(status, 200)
+        self.assertIn('class="card item"', html)
+        self.assertEqual(
+            self.app.store.outcome_history("kid1", "sci.3-5.lever-fulcrum"), [])
+
     def test_crafted_garbage_boolean_records_nothing(self):
         status, _, _ = post(self.app, "/answer",
                             {"learner": ["kid1"], "item": ["ip2"]}, "response=banana")
@@ -221,6 +246,113 @@ class TestWebHardening(unittest.TestCase):
         for evil in ("attacker.example", "attacker.example:8799",
                      "127.0.0.1.attacker.example:8799", ""):
             self.assertFalse(_host_ok(evil, allowed), evil)
+
+
+class TestSeamFailureFallback(unittest.TestCase):
+    def test_seam_error_falls_back_to_local_citation(self):
+        # Independent audit F2 gap 3: Rule 1 must hold when the backend RAISES,
+        # not only when no seam is configured.
+        def boom(url, payload):
+            raise RuntimeError("backend down")
+
+        seam = KnowledgeSeam(transport=boom, base_url="https://knowledge.utety")
+        app = App(Store(":memory:"), build_neva_and_theo(), seam=seam)
+        post(app, "/step", {"learner": ["kid1"]})
+        post(app, "/step", {"learner": ["kid1"], "ack": ["exp.ramp"]})
+        _, _, html = post(app, "/answer",
+                          {"learner": ["kid1"], "item": ["ip1"]}, "response=a")
+        self.assertIn("NGSS 3-5-ETS1-1", html,
+                      "local citation must back the claim when the seam fails")
+
+
+class TestOverRealSocket(unittest.TestCase):
+    """Independent audit F2: the socket adapter — Host check wiring,
+    Content-Length handling, body pass-through — pinned by tests instead of
+    manual verification. The store and server live on one thread (as in
+    production); requests come from the test thread."""
+
+    @classmethod
+    def setUpClass(cls):
+        ready = threading.Event()
+        cls.holder = {}
+
+        def run():
+            app = App(Store(":memory:"), build_neva_and_theo())
+            httpd = serve(app, port=0)          # ephemeral port
+            cls.holder["app"] = app
+            cls.holder["httpd"] = httpd
+            ready.set()
+            httpd.serve_forever()
+
+        cls.thread = threading.Thread(target=run, daemon=True)
+        cls.thread.start()
+        if not ready.wait(5):   # a real raise — asserts vanish under -O (A4!)
+            raise RuntimeError("server thread failed to start")
+        cls.port = cls.holder["httpd"].server_address[1]
+        cls.base = f"http://127.0.0.1:{cls.port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.holder["httpd"].shutdown()
+        cls.holder["httpd"].server_close()
+
+    def _raw(self, request_bytes: bytes) -> str:
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as s:
+            s.sendall(request_bytes)
+            return s.recv(4096).decode("utf-8", "replace")
+
+    def test_valid_host_serves_shell_with_token(self):
+        html = urllib.request.urlopen(f"{self.base}/?learner=kid1").read().decode()
+        self.assertIn(self.holder["app"].csrf, html)
+
+    def test_foreign_host_gets_403(self):
+        req = urllib.request.Request(
+            f"{self.base}/", headers={"Host": f"attacker.example:{self.port}"})
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req)
+        self.assertEqual(ctx.exception.code, 403)
+
+    def test_post_body_arrives_intact_and_flows(self):
+        token = self.holder["app"].csrf
+        def post_url(path, body=b""):
+            req = urllib.request.Request(
+                f"{self.base}{path}", data=body,
+                headers={"X-Utety-Csrf": token}, method="POST")
+            return urllib.request.urlopen(req).read().decode()
+
+        step = post_url("/step?learner=sockkid")
+        self.assertIn("First, your hands", step)
+        post_url("/step?learner=sockkid&ack=exp.ramp")
+        feedback = post_url("/answer?learner=sockkid&item=ip1", b"response=a")
+        self.assertIn("hands felt", feedback)   # correct-answer feedback text
+
+    def test_post_without_token_403_over_socket(self):
+        req = urllib.request.Request(
+            f"{self.base}/step?learner=kid1", data=b"", method="POST")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req)
+        self.assertEqual(ctx.exception.code, 403)
+
+    def test_malformed_content_length_400(self):
+        resp = self._raw(
+            b"POST /step?learner=kid1 HTTP/1.1\r\n"
+            + f"Host: 127.0.0.1:{self.port}\r\n".encode()
+            + b"Content-Length: abc\r\n\r\n")
+        self.assertIn(" 400 ", resp.splitlines()[0])
+
+    def test_negative_content_length_400(self):
+        resp = self._raw(
+            b"POST /step?learner=kid1 HTTP/1.1\r\n"
+            + f"Host: 127.0.0.1:{self.port}\r\n".encode()
+            + b"Content-Length: -5\r\n\r\n")
+        self.assertIn(" 400 ", resp.splitlines()[0])
+
+    def test_oversized_content_length_400(self):
+        resp = self._raw(
+            b"POST /step?learner=kid1 HTTP/1.1\r\n"
+            + f"Host: 127.0.0.1:{self.port}\r\n".encode()
+            + b"Content-Length: 999999999\r\n\r\n")
+        self.assertIn(" 400 ", resp.splitlines()[0])
 
 
 class TestFullPlaythroughOverHTTP(unittest.TestCase):

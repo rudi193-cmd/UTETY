@@ -20,6 +20,7 @@ enough to audit in one sitting.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import sqlite3
@@ -135,6 +136,7 @@ class Store:
 
     def __init__(self, path: str | Path = ":memory:") -> None:
         self.path = str(path)
+        self._tx_depth = 0
         # check_same_thread stays True (default): one device, one owner.
         self._db = sqlite3.connect(self.path)
         self._db.row_factory = sqlite3.Row
@@ -158,6 +160,34 @@ class Store:
                 "— update UTETY before opening this store"
             )
 
+    # ── transactions ───────────────────────────────────────────────────────
+    @contextlib.contextmanager
+    def transaction(self):
+        """Make a group of writes atomic: all land or none do.
+
+        Every writing method on this store runs inside one of these, so a
+        sqlite failure mid-method (disk full, database locked) can never leave
+        a partial write pending to be flushed by a later unrelated commit
+        (independent audit 2026-07-14, F1). Nested uses join the outermost
+        transaction — commit/rollback happen only at depth zero — so callers
+        can compose semantically paired writes (an outcome and its disclosure
+        row; a consent flip and its chain entry) into one atomic unit (F5).
+        """
+        if self._tx_depth == 0:
+            self._db.execute("BEGIN IMMEDIATE")
+        self._tx_depth += 1
+        try:
+            yield
+        except BaseException:
+            self._tx_depth -= 1
+            if self._tx_depth == 0:
+                self._db.rollback()
+            raise
+        else:
+            self._tx_depth -= 1
+            if self._tx_depth == 0:
+                self._db.commit()
+
     # ── lifecycle ──────────────────────────────────────────────────────────
     def close(self) -> None:
         self._db.close()
@@ -172,14 +202,14 @@ class Store:
     def add_learner(self, learner_id: str, display_name: str,
                     birth_year: int | None = None) -> None:
         try:
-            self._db.execute(
-                "INSERT INTO learners(id, display_name, birth_year, created_at) "
-                "VALUES(?, ?, ?, ?)",
-                (learner_id, display_name, birth_year, _now()),
-            )
+            with self.transaction():
+                self._db.execute(
+                    "INSERT INTO learners(id, display_name, birth_year, created_at) "
+                    "VALUES(?, ?, ?, ?)",
+                    (learner_id, display_name, birth_year, _now()),
+                )
         except sqlite3.IntegrityError as exc:
             raise StoreError(f"learner already exists: {learner_id!r}") from exc
-        self._db.commit()
 
     def get_learner(self, learner_id: str) -> dict | None:
         row = self._db.execute(
@@ -209,16 +239,19 @@ class Store:
             raise StoreError(f"invalid consent status: {status!r}")
         if self.get_learner(learner_id) is None:
             raise StoreError(f"unknown learner: {learner_id!r}")
-        self._db.execute(
-            "UPDATE learners SET consent_status = ?, consent_by = ?, consent_at = ? "
-            "WHERE id = ?",
-            (status, granted_by, _now(), learner_id),
-        )
-        self._db.commit()
-        self.log_disclosure(
-            learner_id, "consent_changed",
-            payload={"status": status, "by": granted_by},
-        )
+        # One transaction: the consent flip and its chain entry land together
+        # or not at all — a crash between them must not leave an unchained
+        # transition (independent audit 2026-07-14, F5).
+        with self.transaction():
+            self._db.execute(
+                "UPDATE learners SET consent_status = ?, consent_by = ?, consent_at = ? "
+                "WHERE id = ?",
+                (status, granted_by, _now(), learner_id),
+            )
+            self.log_disclosure(
+                learner_id, "consent_changed",
+                payload={"status": status, "by": granted_by},
+            )
 
     # ── skills ─────────────────────────────────────────────────────────────
     def add_skill(self, skill_id: str, subject: str, name: str,
@@ -226,14 +259,14 @@ class Store:
                   params: BKTParams | None = None) -> None:
         p = params or BKTParams()
         try:
-            self._db.execute(
-                "INSERT INTO skills(id, subject, name, standard, prior, learn, guess, slip, forget) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (skill_id, subject, name, standard, p.prior, p.learn, p.guess, p.slip, p.forget),
-            )
+            with self.transaction():
+                self._db.execute(
+                    "INSERT INTO skills(id, subject, name, standard, prior, learn, guess, slip, forget) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (skill_id, subject, name, standard, p.prior, p.learn, p.guess, p.slip, p.forget),
+                )
         except sqlite3.IntegrityError as exc:
             raise StoreError(f"skill already exists: {skill_id!r}") from exc
-        self._db.commit()
 
     def update_skill_params(self, skill_id: str, params: BKTParams) -> None:
         """Replace a skill's BKT parameters (content, not learner state).
@@ -243,12 +276,12 @@ class Store:
         """
         if self.get_skill(skill_id) is None:
             raise StoreError(f"unknown skill: {skill_id!r}")
-        self._db.execute(
-            "UPDATE skills SET prior = ?, learn = ?, guess = ?, slip = ?, forget = ? "
-            "WHERE id = ?",
-            (params.prior, params.learn, params.guess, params.slip, params.forget, skill_id),
-        )
-        self._db.commit()
+        with self.transaction():
+            self._db.execute(
+                "UPDATE skills SET prior = ?, learn = ?, guess = ?, slip = ?, forget = ? "
+                "WHERE id = ?",
+                (params.prior, params.learn, params.guess, params.slip, params.forget, skill_id),
+            )
 
     def get_skill(self, skill_id: str) -> dict | None:
         row = self._db.execute(
@@ -282,30 +315,39 @@ class Store:
         c = 1 if correct else 0
         now = _now()
 
-        cur = self._db.execute(
-            "SELECT p_known, opportunities FROM mastery "
-            "WHERE learner_id = ? AND skill_id = ?",
-            (learner_id, skill_id),
-        ).fetchone()
-        p_prev = cur["p_known"] if cur else params.prior
-        opps = (cur["opportunities"] if cur else 0) + 1
+        # The outcome row and the mastery upsert are a semantically paired
+        # write: a failure between them (disk full, database locked) must roll
+        # back BOTH, or the append-only log permanently desyncs from mastery
+        # state (independent audit 2026-07-14, F1).
+        try:
+            with self.transaction():
+                cur = self._db.execute(
+                    "SELECT p_known, opportunities FROM mastery "
+                    "WHERE learner_id = ? AND skill_id = ?",
+                    (learner_id, skill_id),
+                ).fetchone()
+                p_prev = cur["p_known"] if cur else params.prior
+                opps = (cur["opportunities"] if cur else 0) + 1
 
-        p_new = update(p_prev, bool(c), params)
+                p_new = update(p_prev, bool(c), params)
 
-        self._db.execute(
-            "INSERT INTO outcomes(learner_id, skill_id, item_id, correct, response_ms, created_at) "
-            "VALUES(?, ?, ?, ?, ?, ?)",
-            (learner_id, skill_id, item_id, c, response_ms, now),
-        )
-        self._db.execute(
-            "INSERT INTO mastery(learner_id, skill_id, p_known, opportunities, updated_at) "
-            "VALUES(?, ?, ?, ?, ?) "
-            "ON CONFLICT(learner_id, skill_id) DO UPDATE SET "
-            "p_known = excluded.p_known, opportunities = excluded.opportunities, "
-            "updated_at = excluded.updated_at",
-            (learner_id, skill_id, p_new, opps, now),
-        )
-        self._db.commit()
+                self._db.execute(
+                    "INSERT INTO outcomes(learner_id, skill_id, item_id, correct, response_ms, created_at) "
+                    "VALUES(?, ?, ?, ?, ?, ?)",
+                    (learner_id, skill_id, item_id, c, response_ms, now),
+                )
+                self._db.execute(
+                    "INSERT INTO mastery(learner_id, skill_id, p_known, opportunities, updated_at) "
+                    "VALUES(?, ?, ?, ?, ?) "
+                    "ON CONFLICT(learner_id, skill_id) DO UPDATE SET "
+                    "p_known = excluded.p_known, opportunities = excluded.opportunities, "
+                    "updated_at = excluded.updated_at",
+                    (learner_id, skill_id, p_new, opps, now),
+                )
+        except sqlite3.Error as exc:
+            raise StoreError(
+                "record_outcome failed; no partial write committed"
+            ) from exc
         return p_new
 
     def get_mastery(self, learner_id: str, skill_id: str) -> dict | None:
@@ -350,34 +392,34 @@ class Store:
             raise StoreError(f"unknown learner: {learner_id!r}")
         payload_json = json.dumps(payload or {}, sort_keys=True, separators=(",", ":"))
         now = _now()
-        prev = self._db.execute(
-            "SELECT hash FROM disclosure ORDER BY seq DESC LIMIT 1"
-        ).fetchone()
-        prev_hash = prev["hash"] if prev else _GENESIS_HASH
+        with self.transaction():
+            prev = self._db.execute(
+                "SELECT hash FROM disclosure ORDER BY seq DESC LIMIT 1"
+            ).fetchone()
+            prev_hash = prev["hash"] if prev else _GENESIS_HASH
 
-        # seq is assigned by AUTOINCREMENT; reserve it explicitly so the hash
-        # can bind to it deterministically.
-        next_seq = self._db.execute(
-            "SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM disclosure"
-        ).fetchone()["n"]
-        row_hash = _chain_hash(
-            next_seq, learner_id, kind, payload_json, citation, now, prev_hash
-        )
-        self._db.execute(
-            "INSERT INTO disclosure(seq, learner_id, kind, payload, citation, created_at, prev_hash, hash) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-            (next_seq, learner_id, kind, payload_json, citation, now, prev_hash, row_hash),
-        )
-        # Anchor the head: an edit or mid-chain delete breaks the hash links,
-        # but deleting the NEWEST rows would otherwise leave a chain that still
-        # verifies. Persisting head+count on every append makes truncation
-        # detectable too (audit 2026-07-13, B4).
-        self._db.execute(
-            "INSERT INTO meta(key, value) VALUES('disclosure_head', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (json.dumps({"hash": row_hash, "count": next_seq}),),
-        )
-        self._db.commit()
+            # seq is assigned by AUTOINCREMENT; reserve it explicitly so the
+            # hash can bind to it deterministically.
+            next_seq = self._db.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM disclosure"
+            ).fetchone()["n"]
+            row_hash = _chain_hash(
+                next_seq, learner_id, kind, payload_json, citation, now, prev_hash
+            )
+            self._db.execute(
+                "INSERT INTO disclosure(seq, learner_id, kind, payload, citation, created_at, prev_hash, hash) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                (next_seq, learner_id, kind, payload_json, citation, now, prev_hash, row_hash),
+            )
+            # Anchor the head: an edit or mid-chain delete breaks the hash
+            # links, but deleting the NEWEST rows would otherwise leave a chain
+            # that still verifies. Persisting head+count on every append makes
+            # truncation detectable too (audit 2026-07-13, B4).
+            self._db.execute(
+                "INSERT INTO meta(key, value) VALUES('disclosure_head', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (json.dumps({"hash": row_hash, "count": next_seq}),),
+            )
         return row_hash
 
     def disclosure_log(self, learner_id: str | None = None) -> list[dict]:

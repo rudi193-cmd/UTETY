@@ -28,6 +28,7 @@ select = ["F", "E4", "E7", "E9", "B", "S1", "S3", "S5", "S6", "RUF"]
 ignore = ["RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.lint.per-file-ignores]
-# Tests may use asserts (that's what they're for) and subprocess (the no-egress
-# test intentionally spawns an interpreter).
-"tests/*" = ["S101", "S603"]
+# Tests may use asserts (that's what they're for), subprocess (the no-egress
+# test intentionally spawns an interpreter), and plain-http urllib against the
+# loopback test server (the socket-adapter tests drive a local HTTPServer).
+"tests/*" = ["S101", "S310", "S603"]

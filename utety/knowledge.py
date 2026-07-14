@@ -135,4 +135,6 @@ class KnowledgeSeam:
         payload = {"query": clean}          # no learner field exists to add
         raw = self._transport(f"{self._base_url}/search", payload)
         cards = raw if isinstance(raw, list) else raw.get("cards", [])
-        return [SourcedCard.from_dict(c) for c in cards]
+        # The backend is external input: skip anything that isn't a card-shaped
+        # dict rather than crashing on it (independent audit 2026-07-14, N3).
+        return [SourcedCard.from_dict(c) for c in cards if isinstance(c, dict)]

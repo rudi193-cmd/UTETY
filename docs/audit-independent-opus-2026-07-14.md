@@ -309,3 +309,23 @@ All still fixed:
 *Filed by the session steward on the independent auditor's behalf; the
 auditor's mandate was read-only and no repository file was modified during
 the audit itself.*
+
+## Outcome (same day)
+
+All findings and nits applied (N5 needed no change — it restates the accepted
+threat model). F1/F5: the store gained a nestable `Store.transaction()`
+(`BEGIN IMMEDIATE`, commit/rollback at depth zero only); every writing method
+runs inside one, and the semantically paired writes — outcome+mastery,
+consent+chain entry, answer+disclosure — are each one atomic unit, proved by
+failure-injection tests (a proxy connection that raises mid-write). F2: the
+socket adapter is now driven over a real loopback socket in the suite (valid
+Host → 200 with token, foreign Host → 403, token-less POST → 403, body
+pass-through, malformed/negative/oversized Content-Length → 400), the B5
+https-refusal and the seam-raises fallback are pinned by tests, and the CI
+coverage gate runs `--branch` (94% under branch coverage). F3: out-of-set
+single/multi values re-present instead of grading. F4: Content-Length is
+parsed defensively and capped at 64 KiB. N1–N3: the 500-fragment learner sink
+is escaped, the CSRF compare is constant-time, and non-dict cards from a
+hostile backend are skipped. One process note: the `-O` CI step caught the
+fix batch's own first draft using `assert` for a test-harness control — the
+A4 class, intercepted by the gate built for it.

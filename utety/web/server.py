@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import re
 import secrets
+from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -29,6 +30,7 @@ from . import render
 # (audit bite-4, W4 — no drive-by junk rows).
 _LEARNER_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _MAX_SESSIONS = 64
+_MAX_BODY = 64 * 1024          # far above any real form; caps hostile bodies
 _HTML = "text/html; charset=utf-8"
 _PLAIN = "text/plain; charset=utf-8"
 
@@ -68,9 +70,13 @@ class App:
             if not _LEARNER_RE.match(learner):
                 return 400, _PLAIN, "bad learner id"
             # Header names are case-insensitive on the wire (urllib sends
-            # X-utety-csrf); normalize before comparing.
+            # X-utety-csrf); normalize before comparing. Constant-time compare
+            # (independent audit 2026-07-14, N2).
             hdrs = {k.lower(): v for k, v in (headers or {}).items()}
-            if method == "POST" and hdrs.get("x-utety-csrf") != self.csrf:
+            token = hdrs.get("x-utety-csrf", "")
+            if method == "POST" and not secrets.compare_digest(
+                token.encode("utf-8"), self.csrf.encode("utf-8")
+            ):
                 return 403, _PLAIN, "missing or wrong csrf token"
 
             if method == "GET" and path == "/":
@@ -86,10 +92,13 @@ class App:
 
             return 404, _PLAIN, "not found"
         except Exception:  # a child should never see a stack trace
+            # learner is regex-validated before any exception can arise, but
+            # escape anyway — this is the one sink that isn't a render.*
+            # function (independent audit 2026-07-14, N1).
             return 500, _HTML, (
                 f'<section class="card"><p class="hanz">Something went quiet in the '
                 f"back shelves. Let's try that again.</p>"
-                f'<button class="primary" data-post="/step?learner={learner}">'
+                f'<button class="primary" data-post="/step?learner={escape(learner)}">'
                 f"Keep going</button></section>"
             )
 
@@ -134,6 +143,18 @@ class App:
                 nudge="Pick an answer first — then Check.",
             )
 
+        # Out-of-set values aren't answers either (independent audit
+        # 2026-07-14, F3): a value outside the item's choices would be graded
+        # as a wrong-distractor pick and poison the mastery signal.
+        if item.kind in ("single", "multi"):
+            valid = set(item.choices)
+            picked = set(response) if item.kind == "multi" else {response}
+            if not picked <= valid:
+                return 200, _HTML, render.item_fragment(
+                    sess.present(item_id), item, learner,
+                    nudge="Pick one of the options first — then Check.",
+                )
+
         try:
             result = sess.answer(item_id, response)
         except ValueError:
@@ -175,7 +196,6 @@ def _host_ok(header_host: str, allowed: frozenset[str]) -> bool:
 def serve(app: App, port: int = 8799, host: str = "127.0.0.1") -> HTTPServer:
     """Build the reading-room server (loopback by default). The caller runs
     ``serve_forever()`` on the returned server."""
-    allowed = _allowed_hosts(host, port)
 
     class Handler(BaseHTTPRequestHandler):
         def _dispatch(self, method: str) -> None:
@@ -183,15 +203,21 @@ def serve(app: App, port: int = 8799, host: str = "127.0.0.1") -> HTTPServer:
             # own domain at 127.0.0.1 arrives with its domain in Host. Only
             # names that genuinely mean this device are served.
             if not _host_ok(self.headers.get("Host", ""), allowed):
-                self.send_response(403)
-                self.send_header("Content-Type", _PLAIN)
-                self.end_headers()
-                self.wfile.write(b"unrecognized host")
+                self._reply(403, b"unrecognized host")
+                return
+            # Malformed, negative, or absurd Content-Length must not crash the
+            # handler or block the single-threaded server on an endless read
+            # (independent audit 2026-07-14, F4).
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > _MAX_BODY:
+                self._reply(400, b"bad content length")
                 return
             parsed = urlparse(self.path)
             params = parse_qs(parsed.query)
-            length = int(self.headers.get("Content-Length", 0) or 0)
-            body = self.rfile.read(length).decode("utf-8") if length else ""
+            body = self.rfile.read(length).decode("utf-8", "replace") if length else ""
             status, ctype, text = app.handle(
                 method, parsed.path, params, body, headers=dict(self.headers)
             )
@@ -201,6 +227,13 @@ def serve(app: App, port: int = 8799, host: str = "127.0.0.1") -> HTTPServer:
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+
+        def _reply(self, status: int, body: bytes) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", _PLAIN)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def do_GET(self) -> None:
             self._dispatch("GET")
@@ -212,6 +245,10 @@ def serve(app: App, port: int = 8799, host: str = "127.0.0.1") -> HTTPServer:
             pass  # quiet
 
     httpd = HTTPServer((host, port), Handler)
+    # Compute from the BOUND port so port=0 (ephemeral, used by tests) works;
+    # `allowed` is a closure variable of Handler._dispatch, resolved at
+    # request time, so assigning it here is safe.
+    allowed = _allowed_hosts(host, httpd.server_address[1])
     return httpd
 
 

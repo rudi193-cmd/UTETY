@@ -1,9 +1,27 @@
 #!/usr/bin/env python3
 """Tests for utety/core/store.py — the local-first student-data store."""
+import sqlite3
 import unittest
 
 from utety.core.mastery import BKTParams
 from utety.core.store import Store, StoreError
+
+
+class _FailingDB:
+    """Connection proxy that raises on statements containing a marker —
+    simulates 'disk full' / 'database is locked' mid-write."""
+
+    def __init__(self, real, fail_on: str):
+        self._real = real
+        self._fail_on = fail_on
+
+    def execute(self, sql, *args):
+        if self._fail_on in sql:
+            raise sqlite3.OperationalError("simulated disk I/O error")
+        return self._real.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
 
 
 class TestLearners(unittest.TestCase):
@@ -118,6 +136,73 @@ class TestOutcomesAndMastery(unittest.TestCase):
         state = self.s.mastery_state("kid1")
         self.assertEqual({r["skill_id"] for r in state},
                          {"sci.3-5.forces", "math.3-5.frac"})
+
+
+class TestAtomicity(unittest.TestCase):
+    """Independent audit F1/F5: paired writes land together or not at all."""
+
+    def setUp(self):
+        self.s = Store(":memory:")
+        self.s.add_learner("kid1", "Neva")
+        self.s.add_skill("sci.3-5.forces", "science", "Forces", params=BKTParams())
+
+    def tearDown(self):
+        self.s.close()
+
+    def _fail_on(self, marker):
+        self._real = self.s._db
+        self.s._db = _FailingDB(self._real, marker)
+
+    def _restore(self):
+        self.s._db = self._real
+
+    def test_failed_record_outcome_leaves_no_phantom_row(self):
+        # F1's repro: mastery upsert fails after the outcome insert. The
+        # outcome row must roll back — not linger to be flushed durable by a
+        # later unrelated commit.
+        self._fail_on("INSERT INTO mastery")
+        with self.assertRaises(StoreError):
+            self.s.record_outcome("kid1", "sci.3-5.forces", correct=True)
+        self._restore()
+        self.s.log_disclosure("kid1", "unrelated", payload={})  # later commit
+        self.assertEqual(self.s.outcome_history("kid1", "sci.3-5.forces"), [],
+                         "phantom outcome row survived a failed record_outcome")
+        self.assertIsNone(self.s.get_mastery("kid1", "sci.3-5.forces"))
+
+    def test_failed_disclosure_rolls_back_consent_flip(self):
+        # F5: the consent UPDATE and its chain entry are one atomic unit.
+        self._fail_on("INSERT INTO disclosure")
+        with self.assertRaises(sqlite3.OperationalError):
+            self.s.set_consent("kid1", "granted", granted_by="parent:sean")
+        self._restore()
+        row = self.s.get_learner("kid1")
+        self.assertEqual(row["consent_status"], "pending",
+                         "consent flipped without its disclosure entry")
+        self.assertEqual(self.s.disclosure_log("kid1"), [])
+        self.assertTrue(self.s.verify_disclosure_chain())
+
+    def test_failed_disclosure_rolls_back_the_graded_answer(self):
+        # F5 at loop level: an answer whose disclosure append fails must not
+        # leave a graded outcome the disclosure spine never saw.
+        from utety.content.courses import build_neva_and_theo
+        from utety.content.register import register_course
+        from utety.core.loop import LessonSession
+
+        store = Store(":memory:")
+        course = build_neva_and_theo()
+        register_course(store, course)
+        store.add_learner("kid1", "Theo")
+        sess = LessonSession(store, course, "kid1")
+        sess.acknowledge_experience("exp.ramp")
+
+        real = store._db
+        store._db = _FailingDB(real, "INSERT INTO disclosure")
+        with self.assertRaises(sqlite3.OperationalError):
+            sess.answer("ip1", "a")
+        store._db = real
+        self.assertEqual(
+            store.outcome_history("kid1", "sci.3-5.inclined-plane"), [],
+            "outcome recorded without its disclosure entry")
 
 
 class TestDisclosureChain(unittest.TestCase):

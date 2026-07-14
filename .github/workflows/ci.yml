@@ -71,9 +71,11 @@ jobs:
           python-version: "3.13"
       - run: pip install coverage==7.15.1
       - name: Run suite under coverage and enforce the floor
-        # Floor, not target: currently ~94%. New modules landing without tests
-        # drag the total below 90 and fail here. Raise the floor as coverage
-        # rises; never lower it to make a PR pass.
+        # Floor, not target: currently ~94% (branch coverage). New modules
+        # landing without tests drag the total below 90 and fail here. Raise
+        # the floor as coverage rises; never lower it to make a PR pass.
+        # --branch: untested branches inside covered lines count too
+        # (independent audit 2026-07-14, N4).
         run: |
-          python -m coverage run -m unittest discover -s tests
+          python -m coverage run --branch -m unittest discover -s tests
           python -m coverage report --include='utety/*' --fail-under=90

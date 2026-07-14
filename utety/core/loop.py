@@ -198,22 +198,25 @@ class LessonSession:
             )
 
         correct = item.check(response)
-        p_new = self.store.record_outcome(
-            self.learner_id, item.skill_id, correct=correct, item_id=item_id
-        )
+        # One transaction: the outcome and its disclosure entry land together
+        # or not at all (independent audit 2026-07-14, F5) — a failure must
+        # not leave a graded answer the disclosure spine never saw.
+        with self.store.transaction():
+            p_new = self.store.record_outcome(
+                self.learner_id, item.skill_id, correct=correct, item_id=item_id
+            )
+            # Render-with-source + log-to-ledger: record what was asked and
+            # how it went, with the item's citation, into the disclosure spine.
+            self.store.log_disclosure(
+                self.learner_id, _ANSWER_KIND,
+                payload={
+                    "item": item_id, "skill": item.skill_id,
+                    "correct": correct, "mastery": p_new,
+                },
+                citation=item.citation or None,
+            )
         feedback = item.feedback_for(response)
         is_mastered = self.store.is_mastered(self.learner_id, item.skill_id)
-
-        # Render-with-source + log-to-ledger: record what was asked and how it
-        # went, with the item's citation, into the on-device disclosure spine.
-        self.store.log_disclosure(
-            self.learner_id, _ANSWER_KIND,
-            payload={
-                "item": item_id, "skill": item.skill_id,
-                "correct": correct, "mastery": p_new,
-            },
-            citation=item.citation or None,
-        )
 
         self._recent.append(item_id)
         return Result(
