@@ -11,6 +11,11 @@ dependencies = []
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# VENDORED code is not style-linted here — it is single-sourced from
+# safe-app-store/libs/subject-consent and linted there. UTETY still boundary-tests
+# it (tests/test_boundaries.py walks utety/ including this dir), so the no-egress
+# guarantee holds; only the cosmetic style gate is upstream's domain, not ours.
+extend-exclude = ["utety/subject_consent"]
 
 [tool.ruff.lint]
 # A deliberately small, high-signal gate. Every rule family here maps to an
@@ -31,3 +36,10 @@ ignore = ["RUF001", "RUF002", "RUF003"]
 # Tests may use asserts (that's what they're for) and subprocess (the no-egress
 # test intentionally spawns an interpreter).
 "tests/*" = ["S101", "S603"]
+
+[tool.coverage.report]
+# VENDORED code is covered by its own suite upstream (safe-app-store/libs/
+# subject-consent, 37 tests); UTETY's 90% floor measures UTETY's own code. The
+# adoption still exercises it end-to-end via the SQLite backend — that coverage
+# just isn't counted against this repo's floor.
+omit = ["utety/subject_consent/*"]
