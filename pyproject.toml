@@ -2,6 +2,7 @@
 name = "utety"
 version = "0.0.1"
 description = "UTETY — the classroom-grade pedagogy + trust layer (local-first, stdlib-only)"
+license = "Apache-2.0"
 requires-python = ">=3.11"
 # Runtime dependencies are deliberately EMPTY: utety is stdlib-only
 # (Termux/Windows parity; nothing to install on a child's device).
