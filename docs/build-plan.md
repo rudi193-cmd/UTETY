@@ -132,9 +132,12 @@ Persona (the UTETY voice) supplies **relatedness** (the SDT need the field under
 
 **Phase 0 · Foundations & the two safety-critical items.** *(nothing student-facing ships until
 these hold.)*
-- **[BUILD] Close B-37 (P0).** The `consent.internet` switch must actually govern egress, or the
-  local-first architecture (Rule 3) must make egress structurally impossible for student data.
-  Whichever ships, *no student PII moves until one does.*
+- **[DONE 2026-07-22] Close B-37 (P0).** The `consent.internet` switch now actually governs
+  egress: a fail-closed `ConsentGate` in `utety/knowledge.py` is checked before any bytes are
+  prepared, so with consent off nothing leaves and the transport is never constructed. Enforced
+  at UTETY's own boundary — `UTETY_CONSENT_INTERNET` standalone, willow-mcp's `consent.internet`
+  injected in the fleet — because UTETY is local-first and can't assume the fleet gate is present.
+  6 gate tests incl. consent-off-never-touches-transport and fail-closed default; 136/136 green.
 - **[BUILD] `UtetyAdapter(BaseAdapter)`** — UTETY's own `app_id`, manifest (`integration_net`
   capability), backend URL, secret. Rides the three-key egress gate for free.
 - **[BUILD] Local-first data core** — on-device store; optional consented sync as a *later*,

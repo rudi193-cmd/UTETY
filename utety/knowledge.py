@@ -18,8 +18,14 @@ The privacy control is STRUCTURAL, not merely policy:
     (email / phone / SSN / card / secret) as defense-in-depth.
   * Egress rides UTETY's OWN identity — WILLOW_UTETY_KNOWLEDGE_URL +
     WILLOW_UTETY_SECRET, the `utety` app_id and its manifest `integration_net`
-    grant (the founding rule; never the `jeles` adapter). The willow-mcp
-    three-key egress gate (post-B-37) governs the actual send.
+    grant (the founding rule; never the `jeles` adapter).
+  * `consent.internet` actually governs the send (B-37, P0, closed here). A
+    fail-closed `ConsentGate` is checked BEFORE anything is prepared: with
+    consent off, no bytes leave and the transport is never constructed.
+    Standalone, `UTETY_CONSENT_INTERNET` is the local guardian switch; in the
+    fleet, willow-mcp's `consent.internet` is injected as the gate. Either way
+    the switch is enforced at UTETY's own boundary, not deferred to a gate that
+    isn't present when UTETY runs alone.
 
 Transport is injected so the seam is testable with no live backend. The default
 transport is a thin stdlib HTTPS POST under UTETY's identity; tests pass a fake.
@@ -31,7 +37,46 @@ import os
 import re
 import urllib.request
 from dataclasses import dataclass
-from typing import Callable, Protocol
+from typing import Callable, Protocol, runtime_checkable
+
+
+# ── consent.internet — the switch that actually governs egress (B-37, P0) ──────
+# The build-plan's Phase-0 safety item: `consent.internet` must actually govern
+# egress, or no student PII moves. In the fleet, willow-mcp's three-key gate
+# supplies that switch — but UTETY is local-first and may run STANDALONE, where
+# that gate isn't present. So the switch is enforced HERE, at UTETY's own
+# transport boundary, fail-closed: with no consent configured, nothing egresses.
+# The fleet wires its `consent.internet` in by injecting a gate; standalone,
+# the UTETY_CONSENT_INTERNET env switch is the local guardian control.
+class ConsentDenied(RuntimeError):
+    """Raised when egress is attempted without internet consent. A raise, never
+    a silent skip — a privacy control must not be swallowable (audit A4)."""
+
+
+@runtime_checkable
+class ConsentGate(Protocol):
+    def internet_allowed(self) -> bool: ...
+
+
+@dataclass(frozen=True)
+class StaticConsent:
+    """Explicit in-code consent state — for config and tests. Default DENY."""
+
+    granted: bool = False
+
+    def internet_allowed(self) -> bool:
+        return self.granted
+
+
+class EnvConsent:
+    """The standalone local switch: reads ``UTETY_CONSENT_INTERNET``. Grants ONLY
+    on an explicit affirmative token; unset / empty / anything else DENIES. A
+    consent switch on a minor's device fails closed by construction."""
+
+    _AFFIRM = frozenset({"granted", "1", "true", "yes", "on", "allow"})
+
+    def internet_allowed(self) -> bool:
+        return os.environ.get("UTETY_CONSENT_INTERNET", "").strip().lower() in self._AFFIRM
 
 # ── de-identification (vendored, compact; primary control is structural) ───────
 _REDACTED = "[redacted]"
@@ -114,13 +159,27 @@ class KnowledgeSeam:
     signature, not just the docstring.
     """
 
-    def __init__(self, transport: Transport | None = None, base_url: str | None = None) -> None:
+    def __init__(self, transport: Transport | None = None, base_url: str | None = None,
+                 consent: ConsentGate | None = None) -> None:
         self._transport = transport or _http_transport
         # UTETY's OWN knowledge endpoint — not the jeles lane (founding rule).
         self._base_url = (base_url or os.environ.get("WILLOW_UTETY_KNOWLEDGE_URL", "")).rstrip("/")
+        # The egress switch. Fail-closed default (EnvConsent denies unless the
+        # local guardian switch is explicitly set); the fleet injects its own.
+        self._consent = consent if consent is not None else EnvConsent()
 
     def back(self, query: str) -> list[SourcedCard]:
-        """Fetch sourced cards backing a concept query. De-identifies first."""
+        """Fetch sourced cards backing a concept query. De-identifies first.
+
+        Egress is refused outright unless internet consent is granted — the
+        check runs BEFORE anything is prepared or sent, so with consent off no
+        bytes leave the device and the transport is never even constructed."""
+        if not self._consent.internet_allowed():
+            raise ConsentDenied(
+                "internet consent is off — the knowledge seam will not egress. "
+                "Grant it via UTETY_CONSENT_INTERNET (standalone) or inject a "
+                "granting ConsentGate (fleet: willow-mcp consent.internet)."
+            )
         if not self._base_url:
             raise RuntimeError(
                 "WILLOW_UTETY_KNOWLEDGE_URL is not set — the knowledge endpoint "
