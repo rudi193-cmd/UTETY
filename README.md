@@ -2,10 +2,7 @@
 
 **The classroom-grade pedagogy + trust layer.** Local-first, stdlib-only, on-device.
 
-UTETY owns the *learner*: BKT mastery tracking, STEM practice items, and the
-student-data store — all of it living on the learner's own device. It is the
-pedagogy engine behind the UTETY campus (utety-chat), built against the settled
-seam: **UTETY owns the learner and the content; Jeles (the library) owns the
+BKT mastery tracking, STEM practice items, and the student-data store — all of it living on the learner's own device. It is the pedagogy engine behind the UTETY campus (utety-chat), built against the settled seam: **UTETY holds the learner and the content; Jeles (the library) holds the
 sources.** When the tutor needs to back a claim, it sends the library a
 de-identified question about a *concept* and gets sourced cards back. Student
 data never crosses off the device.
