@@ -14,8 +14,11 @@ from utety.content.register import register_course
 from utety.core.loop import LessonSession
 from utety.core.store import Store
 from utety.knowledge import (
+    ConsentDenied,
+    EnvConsent,
     KnowledgeSeam,
     SourcedCard,
+    StaticConsent,
     contains_pii,
     deidentify,
 )
@@ -71,7 +74,8 @@ class TestSeamStructuralPrivacy(unittest.TestCase):
             seen["payload"] = payload
             return {"cards": []}
 
-        seam = KnowledgeSeam(transport=fake, base_url="https://knowledge.utety")
+        seam = KnowledgeSeam(transport=fake, base_url="https://knowledge.utety",
+                             consent=StaticConsent(True))
         seam.back("why does a lever multiply force")
         self.assertEqual(set(seen["payload"].keys()), {"query"})
         self.assertTrue(seen["url"].endswith("/search"))
@@ -83,7 +87,8 @@ class TestSeamStructuralPrivacy(unittest.TestCase):
             seen["payload"] = payload
             return {"cards": []}
 
-        seam = KnowledgeSeam(transport=fake, base_url="https://knowledge.utety")
+        seam = KnowledgeSeam(transport=fake, base_url="https://knowledge.utety",
+                             consent=StaticConsent(True))
         seam.back("student neva@example.com asks why the fulcrum matters")
         self.assertFalse(contains_pii(seen["payload"]["query"]))
         self.assertNotIn("@", seen["payload"]["query"])
@@ -98,7 +103,8 @@ class TestSeamBehavior(unittest.TestCase):
                  "date": "1638"},
             ]}
 
-        seam = KnowledgeSeam(transport=fake, base_url="https://knowledge.utety")
+        seam = KnowledgeSeam(transport=fake, base_url="https://knowledge.utety",
+                             consent=StaticConsent(True))
         cards = seam.back("do heavier objects fall faster")
         self.assertEqual(len(cards), 1)
         self.assertIsInstance(cards[0], SourcedCard)
@@ -108,12 +114,94 @@ class TestSeamBehavior(unittest.TestCase):
         def fake(url, payload):
             return [{"url": "u", "source": "s"}]
 
-        seam = KnowledgeSeam(transport=fake, base_url="https://knowledge.utety")
+        seam = KnowledgeSeam(transport=fake, base_url="https://knowledge.utety",
+                             consent=StaticConsent(True))
         self.assertEqual(len(seam.back("q")), 1)
 
     def test_raises_without_endpoint(self):
-        seam = KnowledgeSeam(transport=lambda u, p: {}, base_url="")
+        seam = KnowledgeSeam(transport=lambda u, p: {}, base_url="",
+                             consent=StaticConsent(True))
         with self.assertRaises(RuntimeError):
+            seam.back("q")
+
+
+class TestConsentGovernsEgress(unittest.TestCase):
+    """B-37 (P0): consent.internet must actually govern egress. With consent
+    off, no bytes leave the device — the transport is never even reached."""
+
+    def test_consent_off_refuses_and_never_touches_transport(self):
+        calls = []
+
+        def spy(url, payload):
+            calls.append((url, payload))     # must never run
+            return {"cards": []}
+
+        seam = KnowledgeSeam(transport=spy, base_url="https://knowledge.utety",
+                             consent=StaticConsent(False))
+        with self.assertRaises(ConsentDenied):
+            seam.back("why does a ramp reduce force")
+        self.assertEqual(calls, [])          # nothing egressed
+
+    def test_default_is_fail_closed(self):
+        # No consent argument, env unset → deny. The switch defaults to OFF.
+        import os
+        old = os.environ.pop("UTETY_CONSENT_INTERNET", None)
+        try:
+            seam = KnowledgeSeam(transport=lambda u, p: {"cards": []},
+                                 base_url="https://knowledge.utety")
+            with self.assertRaises(ConsentDenied):
+                seam.back("what is a fulcrum")
+        finally:
+            if old is not None:
+                os.environ["UTETY_CONSENT_INTERNET"] = old
+
+    def test_consent_checked_before_endpoint_and_deidentify(self):
+        # Consent denial must precede every other step: even with no endpoint
+        # and a PII-laden query, the failure is ConsentDenied, and nothing is
+        # prepared or sent.
+        seam = KnowledgeSeam(transport=lambda u, p: {}, base_url="",
+                             consent=StaticConsent(False))
+        with self.assertRaises(ConsentDenied):
+            seam.back("student neva@example.com asks about ramps")
+
+    def test_consent_on_sends(self):
+        seen = {}
+
+        def fake(url, payload):
+            seen["ok"] = True
+            return {"cards": [{"url": "u", "source": "s"}]}
+
+        seam = KnowledgeSeam(transport=fake, base_url="https://knowledge.utety",
+                             consent=StaticConsent(True))
+        self.assertEqual(len(seam.back("what is a lever")), 1)
+        self.assertTrue(seen.get("ok"))
+
+    def test_env_consent_fail_closed_semantics(self):
+        import os
+        gate = EnvConsent()
+        cases = {"": False, "  ": False, "false": False, "0": False, "off": False,
+                 "no": False, "maybe": False, "granted": True, "true": True,
+                 "1": True, "yes": True, "ON": True, "Allow": True}
+        old = os.environ.get("UTETY_CONSENT_INTERNET")
+        try:
+            for val, expected in cases.items():
+                os.environ["UTETY_CONSENT_INTERNET"] = val
+                self.assertEqual(gate.internet_allowed(), expected, f"{val!r}")
+            os.environ.pop("UTETY_CONSENT_INTERNET", None)
+            self.assertFalse(gate.internet_allowed())   # unset → deny
+        finally:
+            if old is not None:
+                os.environ["UTETY_CONSENT_INTERNET"] = old
+            else:
+                os.environ.pop("UTETY_CONSENT_INTERNET", None)
+
+    def test_denial_is_a_raise_not_a_return(self):
+        # A privacy control that could be swallowed is not a control. back()
+        # raises; it never returns [] on denial (which a caller might ignore).
+        seam = KnowledgeSeam(transport=lambda u, p: {"cards": []},
+                             base_url="https://knowledge.utety",
+                             consent=StaticConsent(False))
+        with self.assertRaises(ConsentDenied):
             seam.back("q")
 
 
@@ -135,7 +223,8 @@ class TestEndToEndWithLoop(unittest.TestCase):
             seen["payload"] = payload
             return {"cards": [{"url": "u", "source": "NGSS 3-5-ETS1-1"}]}
 
-        seam = KnowledgeSeam(transport=fake, base_url="https://knowledge.utety")
+        seam = KnowledgeSeam(transport=fake, base_url="https://knowledge.utety",
+                             consent=StaticConsent(True))
         cards = seam.back(result.source_query)
 
         self.assertTrue(cards)

@@ -6,7 +6,7 @@ import unittest
 
 from utety.content.courses import build_neva_and_theo
 from utety.core.loop import Presentation, Result
-from utety.knowledge import KnowledgeSeam, SourcedCard
+from utety.knowledge import KnowledgeSeam, SourcedCard, StaticConsent
 from utety.core.store import Store
 from utety.web import render
 from utety.web.server import App
@@ -115,7 +115,7 @@ class TestAppRouting(unittest.TestCase):
     def test_seam_cards_used_when_configured(self):
         seam = KnowledgeSeam(transport=lambda u, p: {"cards": [
             {"url": "https://galileo", "source": "Two New Sciences", "confidence": "high"}]},
-            base_url="https://knowledge.utety")
+            base_url="https://knowledge.utety", consent=StaticConsent(True))
         app = App(Store(":memory:"), build_neva_and_theo(), seam=seam)
         app.handle("GET", "/", {"learner": ["kid1"]}, "")
         post(app, "/step", {"learner": ["kid1"], "ack": ["exp.ramp"]})
