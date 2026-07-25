@@ -67,6 +67,7 @@ class TestOutcomesAndMastery(unittest.TestCase):
     def setUp(self):
         self.s = Store(":memory:")
         self.s.add_learner("kid1", "Theo")
+        self.s.grant_consent("kid1", "parent:test")   # fail-closed consent gate (B7)
         self.s.add_skill(
             "sci.3-5.forces", "science", "Forces & Motion",
             standard="NGSS 3-PS2-1",
@@ -209,6 +210,7 @@ class TestPersistence(unittest.TestCase):
         try:
             with Store(path) as s:
                 s.add_learner("kid1", "Neva")
+                s.grant_consent("kid1", "parent:test")   # fail-closed consent gate (B7)
                 s.add_skill("sci.3-5.forces", "science", "Forces", params=BKTParams())
                 s.record_outcome("kid1", "sci.3-5.forces", correct=True)
             with Store(path) as s2:

@@ -213,6 +213,7 @@ class TestEndToEndWithLoop(unittest.TestCase):
         course = build_neva_and_theo()
         register_course(store, course)
         store.add_learner("kid1", "Theo Q. Student")
+        store.grant_consent("kid1", "parent:test")   # fail-closed consent gate (B7)
         sess = LessonSession(store, course, "kid1")
         sess.acknowledge_experience("exp.ramp")
         result = sess.answer("ip1", "a")

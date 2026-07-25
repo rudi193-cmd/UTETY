@@ -27,10 +27,19 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+from .. import subject_consent
+from .consent_backend import SqliteBackend
 from .mastery import BKTParams, mastered, update
 
 SCHEMA_VERSION = 1
 _GENESIS_HASH = "0" * 64
+
+# The runtime consent gate. A tutoring session runs and records a child's
+# practice data on the device, so it requires this scope — "the subject's data
+# may live on this device" (subject_consent.SCOPES). Without a verified grant the
+# session cannot open and no outcome is written (B7, fail-closed). Wider uses
+# (process_analysis / kb_promotion / person_inference) gate their own scopes.
+RUNTIME_SCOPE = "local_only"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -103,6 +112,13 @@ class StoreError(RuntimeError):
     """Raised on invariant violations (unknown learner/skill, tamper, ...)."""
 
 
+class ConsentError(StoreError):
+    """Raised when a runtime path is reached without a verified consent grant.
+    Subclass of StoreError so existing `except StoreError` sites still catch it,
+    but distinguishable for callers that want to surface a consent-specific
+    message to a guardian."""
+
+
 def _now() -> float:
     return time.time()
 
@@ -145,6 +161,12 @@ class Store:
             (str(SCHEMA_VERSION),),
         )
         self._db.commit()
+        # The single authoritative consent store (B7/A1/A2): the shared
+        # subject_consent hash-chain, landed in THIS same on-device DB via the
+        # SqliteBackend. All grant/revoke/gating goes through it; the flat
+        # learners.consent_* columns are a derived mirror kept for display only,
+        # written from the same call so the two can no longer disagree (A2).
+        self.consent = SqliteBackend(self._db)
         # Refuse a store written by a NEWER schema: proceeding blindly could
         # corrupt a child's data. Older versions migrate here when migrations
         # exist (audit 2026-07-13, B6).
@@ -193,32 +215,71 @@ class Store:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def set_consent(self, learner_id: str, status: str,
-                    granted_by: str | None = None) -> None:
-        """Record verifiable-parental-consent state (build-plan rule 4).
+    def consent_permitted(self, learner_id: str, scope: str = RUNTIME_SCOPE) -> bool:
+        """The gate: True only when the subject_consent chain's latest transition
+        for (learner, scope) is a verified GRANTED. Fail-closed on every other
+        path — absent, revoked, or a broken/tampered chain all return False."""
+        return subject_consent.permitted(self.consent, learner_id, scope)
 
-        status: 'pending' | 'granted' | 'revoked'. The store persists it; the
-        Phase-2 age-gate is what *enforces* it before any child uses the tutor.
+    def require_consent(self, learner_id: str, scope: str = RUNTIME_SCOPE) -> None:
+        """Fail-closed guard for the runtime paths (session open, outcome write).
+        Raises ConsentError unless a verified grant exists for this scope."""
+        if not self.consent_permitted(learner_id, scope):
+            raise ConsentError(
+                f"consent not granted for learner {learner_id!r} (scope {scope!r}) — "
+                "a guardian must grant_consent before the tutor may run or record")
 
-        Every transition is timestamped (revocation included — erasing *when*
-        consent was withdrawn would gut the audit trail) and appended to the
-        tamper-evident disclosure chain, so the consent history is inspectable
-        and unforgeable after the fact (audit 2026-07-13, B2).
-        """
-        if status not in ("pending", "granted", "revoked"):
-            raise StoreError(f"invalid consent status: {status!r}")
-        if self.get_learner(learner_id) is None:
-            raise StoreError(f"unknown learner: {learner_id!r}")
+    def _mirror_consent(self, learner_id: str, status: str, by: str | None) -> None:
+        """Write the display-only mirror columns from the authoritative chain
+        outcome, in the same call, so learners.consent_status can never drift from
+        the subject_consent chain (A2 — the two-models divergence)."""
         self._db.execute(
             "UPDATE learners SET consent_status = ?, consent_by = ?, consent_at = ? "
             "WHERE id = ?",
-            (status, granted_by, _now(), learner_id),
+            (status, by, _now(), learner_id),
         )
         self._db.commit()
-        self.log_disclosure(
-            learner_id, "consent_changed",
-            payload={"status": status, "by": granted_by},
-        )
+        self.log_disclosure(learner_id, "consent_changed",
+                            payload={"status": status, "by": by, "scope": RUNTIME_SCOPE})
+
+    def grant_consent(self, learner_id: str, granted_by: str,
+                      scope: str = RUNTIME_SCOPE) -> None:
+        """Guardian grants consent for a scope. Recorded on the tamper-evident
+        subject_consent chain (the authority) + mirrored for display."""
+        if self.get_learner(learner_id) is None:
+            raise StoreError(f"unknown learner: {learner_id!r}")
+        subject_consent.grant(self.consent, learner_id, scope, granted_by)
+        self._mirror_consent(learner_id, "granted", granted_by)
+
+    def revoke_consent(self, learner_id: str, revoked_by: str,
+                       scope: str = RUNTIME_SCOPE) -> None:
+        """Guardian withdraws consent. Denies from this moment on — and because
+        the runtime gates read the chain, this now has real effect (A1): the next
+        session open and outcome write are refused."""
+        if self.get_learner(learner_id) is None:
+            raise StoreError(f"unknown learner: {learner_id!r}")
+        subject_consent.revoke(self.consent, learner_id, scope, revoked_by)
+        self._mirror_consent(learner_id, "revoked", revoked_by)
+
+    def set_consent(self, learner_id: str, status: str,
+                    granted_by: str | None = None) -> None:
+        """Backward-compatible shim over the consolidated consent API (B7/A2).
+        'granted' → grant_consent, 'revoked' → revoke_consent. 'pending' is the
+        initial absence of a grant, not a settable transition on an append-only
+        chain — a learner starts pending and returns to a denied state via
+        revoke, so it is refused here to keep the chain the single source."""
+        if status == "granted":
+            if not granted_by:
+                raise StoreError("granting consent requires granted_by (a guardian)")
+            self.grant_consent(learner_id, granted_by)
+        elif status == "revoked":
+            self.revoke_consent(learner_id, granted_by or "unspecified")
+        elif status == "pending":
+            raise StoreError(
+                "cannot set 'pending' — it is the initial no-grant state; use "
+                "revoke_consent to withdraw a prior grant")
+        else:
+            raise StoreError(f"invalid consent status: {status!r}")
 
     # ── skills ─────────────────────────────────────────────────────────────
     def add_skill(self, skill_id: str, subject: str, name: str,
@@ -278,6 +339,10 @@ class Store:
         """
         if self.get_learner(learner_id) is None:
             raise StoreError(f"unknown learner: {learner_id!r}")
+        # Fail-closed (B7): a child's practice outcome is their data landing on the
+        # device — refuse to write it without a verified guardian grant, even if a
+        # caller drives the store directly rather than through a LessonSession.
+        self.require_consent(learner_id)
         params = self._skill_params(skill_id)
         c = 1 if correct else 0
         now = _now()

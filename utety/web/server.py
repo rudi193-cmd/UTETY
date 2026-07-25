@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlparse
 from ..content.model import Course
 from ..content.register import register_course
 from ..core.loop import LessonSession
-from ..core.store import Store
+from ..core.store import ConsentError, Store
 from ..knowledge import KnowledgeSeam, SourcedCard
 from . import render
 
@@ -85,6 +85,14 @@ class App:
                 return self._answer(params, body)
 
             return 404, _PLAIN, "not found"
+        except ConsentError:
+            # Fail-closed (B7): no verified guardian grant, so the tutor will not
+            # run or record. Surface a clear guardian-facing state — not a served
+            # lesson, and not a generic error a child would read as a glitch.
+            return 403, _HTML, (
+                '<section class="card"><p class="hanz">A grown-up needs to set '
+                'this up first.</p><p>A parent or guardian has to give consent '
+                'before we can begin.</p></section>')
         except Exception:  # a child should never see a stack trace
             return 500, _HTML, (
                 f'<section class="card"><p class="hanz">Something went quiet in the '
