@@ -12,7 +12,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Daily drift catcher, off the :00/:30 peak-load minutes — fleet pattern.
+    - cron: "27 5 * * *"
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
