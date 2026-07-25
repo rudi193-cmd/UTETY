@@ -83,3 +83,13 @@ jobs:
         run: |
           python -m coverage run -m unittest discover -s tests
           python -m coverage report --include='utety/*' --fail-under=90
+
+  green:
+    # Aggregate gate: branch protection across the fleet requires a single
+    # check named exactly "test". Green only when every required job is —
+    # consistent with the no-advisory-checks doctrine, not a bypass of it.
+    name: test
+    needs: [test, lint, coverage]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "all required jobs green"
