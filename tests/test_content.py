@@ -210,6 +210,7 @@ class TestRegistration(unittest.TestCase):
         with Store(":memory:") as s:
             register_course(s, course)
             s.add_learner("kid1", "Neva")
+            s.grant_consent("kid1", "parent:test")   # fail-closed consent gate (B7)
             for _ in range(15):
                 s.record_outcome("kid1", "sci.3-5.lever-fulcrum", correct=True)
             self.assertTrue(s.is_mastered("kid1", "sci.3-5.lever-fulcrum"))

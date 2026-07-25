@@ -17,6 +17,15 @@ def post(app: App, path: str, params: dict, body: str = ""):
     return app.handle("POST", path, params, body, {"X-Utety-Csrf": app.csrf})
 
 
+def _consented(app: App, learner: str = "kid1") -> App:
+    """Pre-provision a learner WITH a guardian grant so the fail-closed consent
+    gate (B7) lets the lesson flow run. Returns the app for chaining."""
+    if app.store.get_learner(learner) is None:
+        app.store.add_learner(learner, "Explorer")
+    app.store.grant_consent(learner, "parent:test")
+    return app
+
+
 class TestRender(unittest.TestCase):
     def setUp(self):
         self.course = build_neva_and_theo()
@@ -82,6 +91,7 @@ class TestRender(unittest.TestCase):
 class TestAppRouting(unittest.TestCase):
     def setUp(self):
         self.app = App(Store(":memory:"), build_neva_and_theo())
+        _consented(self.app)
 
     def test_root_serves_page(self):
         status, ctype, html = self.app.handle("GET", "/", {"learner": ["kid1"]}, "")
@@ -117,6 +127,7 @@ class TestAppRouting(unittest.TestCase):
             {"url": "https://galileo", "source": "Two New Sciences", "confidence": "high"}]},
             base_url="https://knowledge.utety", consent=StaticConsent(True))
         app = App(Store(":memory:"), build_neva_and_theo(), seam=seam)
+        _consented(app)
         app.handle("GET", "/", {"learner": ["kid1"]}, "")
         post(app, "/step", {"learner": ["kid1"], "ack": ["exp.ramp"]})
         _, _, html = post(app, "/answer",
@@ -130,6 +141,7 @@ class TestAbsenceIsNeverGraded(unittest.TestCase):
 
     def setUp(self):
         self.app = App(Store(":memory:"), build_neva_and_theo())
+        _consented(self.app)
         post(self.app, "/step", {"learner": ["kid1"]})
         post(self.app, "/step", {"learner": ["kid1"], "ack": ["exp.ramp"]})
 
@@ -180,6 +192,7 @@ class TestAbsenceIsNeverGraded(unittest.TestCase):
 class TestWebHardening(unittest.TestCase):
     def setUp(self):
         self.app = App(Store(":memory:"), build_neva_and_theo())
+        _consented(self.app)
 
     def test_post_without_csrf_token_403(self):
         # Audit bite-4 W2: no cross-origin page can blind-fire writes.
@@ -231,6 +244,7 @@ class TestFullPlaythroughOverHTTP(unittest.TestCase):
 
     def test_plays_to_completion_through_the_router(self):
         app = App(Store(":memory:"), build_neva_and_theo())
+        _consented(app)
         app.handle("GET", "/", {"learner": ["kid1"]}, "")
         _, _, html = post(app, "/step", {"learner": ["kid1"]})
 

@@ -14,6 +14,7 @@ def _fresh():
     course = build_neva_and_theo()
     register_course(store, course)
     store.add_learner("kid1", "Theo")
+    store.grant_consent("kid1", "parent:test")   # fail-closed consent gate (B7)
     return store, course
 
 
@@ -150,6 +151,7 @@ class TestNoFalseComplete(unittest.TestCase):
         store = Store(":memory:")
         register_course(store, course)
         store.add_learner("kid1", "Theo")
+        store.grant_consent("kid1", "parent:test")   # fail-closed consent gate (B7)
         sess = LessonSession(store, course, "kid1")
 
         step = sess.next_step()

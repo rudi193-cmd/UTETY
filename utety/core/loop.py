@@ -96,6 +96,10 @@ class LessonSession:
                 raise ValueError(
                     f"skill {s.id!r} not registered in store — call register_course first"
                 )
+        # Fail-closed consent gate (B7): a session cannot open for a child without
+        # a verified guardian grant. Checked after the existence/registration
+        # errors so those keep their ValueError; consent raises ConsentError.
+        store.require_consent(learner_id)
         self._recent: list[str] = []
         self._acked: set[str] = {
             row["payload"].get("experience")
