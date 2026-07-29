@@ -61,7 +61,20 @@ class SqliteBackend:
             "SELECT row FROM sc_chain WHERE chain = ? ORDER BY seq", (chain,)
         )
         rows = [json.loads(r[0]) for r in cur.fetchall()]
-        return rows or None  # None == "chain absent", distinct from [] for the core
+        if rows:
+            return rows
+        # EMPTIED IS NOT ABSENT. `None` means "no such chain", which the core
+        # treats as legitimately not-tampered; `[]` means "present and empty",
+        # which `_verify` rejects whenever an anchor names rows. Returning `None`
+        # for both hands over the strongest attack available and the simplest:
+        # delete every row and the log reads as one that never existed.
+        #
+        # This backend can tell them apart and the file backend cannot, because
+        # the anchor is a row in `sc_anchor` on the same connection and survives
+        # a delete against `sc_chain`. An orphaned anchor is positive evidence
+        # that rows were here. So: `[]` while an anchor remains, `None` only when
+        # there is genuinely nothing.
+        return [] if self.read_anchor(chain) is not None else None
 
     def append_row(self, chain: str, row: dict) -> None:
         # No commit here: the anchor write commits the pair as one transaction.

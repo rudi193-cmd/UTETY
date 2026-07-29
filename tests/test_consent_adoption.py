@@ -123,5 +123,65 @@ class TestConsentAdoption(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM sc_chain").fetchone()[0], 1)
 
 
+class CompleteTruncationOverSqlite(unittest.TestCase):
+    """The attack the count anchor exists to stop, and the write that erased it.
+
+    `truncation_detected_over_sqlite` above covers lopping off the NEWEST rows.
+    This covers deleting ALL of them, which was invisible: `read_rows` returned
+    None for an emptied chain, None means absent, and absent is legitimately
+    not-tampered. The anchor row was sitting in `sc_anchor` the whole time.
+    """
+
+    def _wiped(self):
+        conn = sqlite3.connect(":memory:")
+        b = SqliteBackend(conn)
+        grant(b, "s1", "local_only", "guardian")
+        grant(b, "s1", "kb_promotion", "guardian")
+        conn.execute("DELETE FROM sc_chain WHERE chain = 'consent'")
+        conn.commit()
+        return conn, b
+
+    def test_an_emptied_chain_reads_as_emptied_not_absent(self):
+        _, b = self._wiped()
+        self.assertEqual(b.read_rows("consent"), [])
+
+    def test_a_genuinely_absent_chain_is_still_none(self):
+        """The control. Without it, returning [] unconditionally passes
+        everything else here and a first grant becomes impossible."""
+        b = SqliteBackend(":memory:")
+        self.assertIsNone(b.read_rows("consent"))
+        self.assertIsNone(b.read_rows("disclosure/never-existed"))
+        grant(b, "fresh", "local_only", "guardian")
+        self.assertTrue(permitted(b, "fresh", "local_only"))
+
+    def test_the_wipe_is_detected(self):
+        _, b = self._wiped()
+        with self.assertRaises(ChainTamperError):
+            verify_consent_chain(b)
+        self.assertFalse(permitted(b, "s1", "kb_promotion"))
+
+    def test_an_honest_write_cannot_relaunder_the_chain(self):
+        """The detection window used to be self-closing: the next ordinary grant
+        restarted at genesis, overwrote the orphaned anchor with count=1, and the
+        store verified clean with the deleted history gone."""
+        conn, b = self._wiped()
+        with self.assertRaises(ChainTamperError):
+            grant(b, "s1", "local_only", "guardian")
+        count = conn.execute(
+            "SELECT count FROM sc_anchor WHERE chain = 'consent'").fetchone()[0]
+        self.assertEqual(count, 2)          # the evidence survived the refusal
+        with self.assertRaises(ChainTamperError):
+            verify_consent_chain(b)
+
+    def test_an_emptied_disclosure_chain_is_refused_too(self):
+        conn = sqlite3.connect(":memory:")
+        b = SqliteBackend(conn)
+        record_disclosure(b, "s1", "read", "teacher")
+        conn.execute("DELETE FROM sc_chain WHERE chain LIKE 'disclosure/%'")
+        conn.commit()
+        with self.assertRaises(ChainTamperError):
+            record_disclosure(b, "s1", "read", "teacher")
+
+
 if __name__ == "__main__":
     unittest.main()
