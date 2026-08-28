@@ -38,11 +38,18 @@ jobs:
         # Termux/Windows-parity ground rule from the build plan.
         os: [ubuntu-latest]
         python: ["3.11", "3.12", "3.13"]
-        include:
-          - os: windows-latest
-            python: "3.13"
-          - os: windows-latest
-            python: "3.11"
+        # Windows runs on push, schedule and dispatch — NOT on pull_request.
+        # Not a retreat from the parity ground rule: the Windows legs are
+        # queue-bound, not compute-bound. Measured on run 33093946137 — every
+        # Linux leg finished 21s in, then `tests · py3.13 · windows-latest`
+        # sat 300s waiting for a runner and ran for 25s. The same job took 28s
+        # four days earlier; the 12x swing is runner availability, nothing
+        # about this code. That single cell set the whole PR's wall-clock at
+        # 6m01s. Keeping it here would mean every PR pays five minutes of
+        # queue for a check that still runs on merge and again every night.
+        include: ${{ fromJSON(github.event_name == 'pull_request'
+          && '[]'
+          || '[{"os":"windows-latest","python":"3.13"},{"os":"windows-latest","python":"3.11"}]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
